@@ -55,6 +55,12 @@ enum Command {
     Ssh {
         target: String,
     },
+    Auth {
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        json: bool,
+    },
     Put {
         #[arg(short, long)]
         recursive: bool,
@@ -102,6 +108,18 @@ struct RouteStatus {
     connect_ms: Option<u128>,
     error: Option<String>,
     hops: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct AuthStatus {
+    node: String,
+    key_file: Option<String>,
+    key_available: bool,
+    password_env: Option<String>,
+    password_available: bool,
+    agent: bool,
+    agent_available: bool,
+    usable: bool,
 }
 
 #[tokio::main]
@@ -180,6 +198,9 @@ async fn run() -> Result<()> {
                 }
             }
             if !watch || cached {
+                if statuses.iter().all(|s| s.state != "UP") {
+                    bail!("no available routes");
+                }
                 break;
             }
             tokio::time::sleep(Duration::from_secs(config.settings.check_interval_secs)).await;
@@ -201,8 +222,27 @@ async fn run() -> Result<()> {
                     );
                 }
             }
+            if statuses.iter().all(|s| s.state != "UP") {
+                bail!("no available route to {target}");
+            }
         }
         Command::Ssh { target } => ssh(&config, &target).await?,
+        Command::Auth { check, json } => {
+            let statuses = auth_statuses(&config);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&statuses)?);
+            } else {
+                for s in &statuses {
+                    println!(
+                        "{}: key={} password={} agent={} usable={}",
+                        s.node, s.key_available, s.password_available, s.agent_available, s.usable
+                    );
+                }
+            }
+            if check && statuses.iter().any(|s| !s.usable) {
+                bail!("one or more nodes have no available authentication method");
+            }
+        }
         Command::Put {
             recursive,
             target,
@@ -258,6 +298,41 @@ async fn run() -> Result<()> {
         },
     }
     Ok(())
+}
+
+fn auth_statuses(config: &Config) -> Vec<AuthStatus> {
+    config
+        .nodes
+        .iter()
+        .map(|(id, node)| {
+            let key_available = node.key_file.as_ref().is_some_and(|path| {
+                let expanded = if let Some(rest) = path.strip_prefix("~/") {
+                    dirs::home_dir().map(|home| home.join(rest))
+                } else {
+                    Some(PathBuf::from(path))
+                };
+                expanded.is_some_and(|path| path.is_file())
+            });
+            let password_available = node
+                .password_env
+                .as_ref()
+                .is_some_and(|name| std::env::var_os(name).is_some());
+            let agent_available = node.agent
+                && cfg!(unix)
+                && std::env::var_os("SSH_AUTH_SOCK")
+                    .is_some_and(|path| std::path::Path::new(&path).exists());
+            AuthStatus {
+                node: id.clone(),
+                key_file: node.key_file.clone(),
+                key_available,
+                password_env: node.password_env.clone(),
+                password_available,
+                agent: node.agent,
+                agent_available,
+                usable: key_available || password_available || agent_available,
+            }
+        })
+        .collect()
 }
 
 fn status_path() -> Result<PathBuf> {

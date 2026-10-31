@@ -17,6 +17,7 @@ mssh status --target internal --details
 mssh status --watch --json
 mssh status --cached
 mssh doctor internal
+mssh auth --check
 mssh ssh internal
 mssh put internal ./archive.tar /home/alice/archive.tar
 mssh get internal /home/alice/archive.tar ./archive.tar
