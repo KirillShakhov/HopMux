@@ -1,5 +1,6 @@
 mod config;
 mod directory;
+mod terminal;
 mod transfer;
 mod transport;
 
@@ -8,10 +9,7 @@ use clap::{Parser, Subcommand};
 use config::{Config, Route};
 use serde::{Deserialize, Serialize};
 use std::{path::PathBuf, sync::Arc, time::Duration};
-use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt},
-    sync::Semaphore,
-};
+use tokio::{io::AsyncWriteExt, sync::Semaphore};
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -390,42 +388,55 @@ async fn shell(connection: &transport::Connection) -> Result<bool> {
         .await?;
     channel.request_shell(true).await?;
     crossterm::terminal::enable_raw_mode().context("cannot enable raw terminal")?;
-    let result = shell_io(channel.into_stream()).await;
+    let result = shell_io(channel, (cols, rows)).await;
     crossterm::terminal::disable_raw_mode()?;
     match result? {
         ShellEnd::InputEnded => Ok(true),
         ShellEnd::ManualReconnect => Ok(false),
-        ShellEnd::RemoteClosed => Ok(!connection.final_handle().is_closed()),
+        ShellEnd::RemoteClosed { exited } => Ok(exited),
     }
 }
 
 enum ShellEnd {
     InputEnded,
     ManualReconnect,
-    RemoteClosed,
+    RemoteClosed { exited: bool },
 }
 
 async fn shell_io(
-    stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    channel: russh::Channel<russh::client::Msg>,
+    mut size: (u16, u16),
 ) -> Result<ShellEnd> {
-    let (mut remote_read, mut remote_write) = tokio::io::split(stream);
-    let mut stdin = tokio::io::stdin();
+    let (mut remote_read, remote_write) = channel.split();
+    let mut remote_input = remote_write.make_writer();
+    let mut stdin = terminal::Input::new()?;
     let mut stdout = tokio::io::stdout();
+    let mut stderr = tokio::io::stderr();
     let mut input = [0u8; 4096];
-    let mut output = [0u8; 4096];
+    let mut exited = false;
+    let mut resize = tokio::time::interval(Duration::from_millis(500));
     loop {
         tokio::select! {
             count = stdin.read(&mut input) => {
                 let count = count?;
                 if count == 0 { return Ok(ShellEnd::InputEnded); }
                 if input[..count].contains(&0x1d) { return Ok(ShellEnd::ManualReconnect); }
-                remote_write.write_all(&input[..count]).await?;
+                remote_input.write_all(&input[..count]).await?;
             }
-            count = remote_read.read(&mut output) => {
-                let count = count?;
-                if count == 0 { return Ok(ShellEnd::RemoteClosed); }
-                stdout.write_all(&output[..count]).await?;
-                stdout.flush().await?;
+            message = remote_read.wait() => {
+                match message {
+                    Some(russh::ChannelMsg::Data { data }) => { stdout.write_all(&data).await?; stdout.flush().await?; }
+                    Some(russh::ChannelMsg::ExtendedData { data, .. }) => { stderr.write_all(&data).await?; stderr.flush().await?; }
+                    Some(russh::ChannelMsg::ExitStatus { .. } | russh::ChannelMsg::ExitSignal { .. }) => exited = true,
+                    Some(russh::ChannelMsg::Close) | None => return Ok(ShellEnd::RemoteClosed { exited }),
+                    _ => {}
+                }
+            }
+            _ = resize.tick() => {
+                if let Ok(next) = crossterm::terminal::size() && next != size {
+                    size = next;
+                    remote_write.window_change(size.0 as u32, size.1 as u32, 0, 0).await?;
+                }
             }
         }
     }

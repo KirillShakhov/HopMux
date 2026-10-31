@@ -32,4 +32,15 @@ Transfers use unique `.mssh-UUID.part` files and owner-only local journals under
 
 ## Current limits
 
-This is a working prototype, not the v0.1 acceptance release. Detailed telemetry and route states, PTY resize propagation, and automated integration tests against multi-hop SSH/SFTP servers are pending. The client saves the last status result but not a history of measurements. Linux runtime behavior still needs testing with real servers. SSH host certificates are rejected until CA and principal validation can be configured.
+This is a working prototype, not the v0.1 acceptance release. Detailed telemetry and route states and automated integration tests against separate multi-hop SSH/SFTP servers are pending. The client saves the last status result but not a history of measurements. SSH host certificates are rejected until CA and principal validation can be configured.
+
+## Local integration stand
+
+On Ubuntu WSL, run `tests/local-stand.sh` as root with the ordinary Linux username as its argument. The script downloads `openssh-server` and `libwrap0` into `/tmp/hopmux-stand`, creates an `sshd` privilege-separation account if necessary, and starts three loopback SSH servers on ports 37221–37223. It does not install the packages system-wide. It writes a pinned test configuration to `/tmp/hopmux-stand/config.toml` and a passwordless key for this disposable stand. Run `tests/local-stand.sh stop` as root to stop the three servers.
+
+```sh
+cargo run -- --config /tmp/hopmux-stand/config.toml status --routes --details
+cargo run -- --config /tmp/hopmux-stand/config.toml ssh target
+```
+
+The stand has been used to check three routes, multi-route upload and download, recursive transfers with an empty directory and symlink, resume after forced process termination, failover after an entrance stops, normal shell exit, and manual and automatic terminal reconnection. Separate physical networks and modem failures remain untested.
