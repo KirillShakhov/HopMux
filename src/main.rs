@@ -1,4 +1,5 @@
 mod config;
+mod directory;
 mod transfer;
 mod transport;
 
@@ -57,11 +58,15 @@ enum Command {
         target: String,
     },
     Put {
+        #[arg(short, long)]
+        recursive: bool,
         target: String,
         source: PathBuf,
         destination: String,
     },
     Get {
+        #[arg(short, long)]
+        recursive: bool,
         target: String,
         source: String,
         destination: PathBuf,
@@ -201,20 +206,32 @@ async fn run() -> Result<()> {
         }
         Command::Ssh { target } => ssh(&config, &target).await?,
         Command::Put {
+            recursive,
             target,
             source,
             destination,
         } => {
-            let id = transfer::put(&config, &target, &source, &destination).await?;
-            println!("uploaded: {id}");
+            if recursive {
+                directory::put_directory(&config, &target, &source, &destination).await?;
+                println!("directory uploaded");
+            } else {
+                let id = transfer::put(&config, &target, &source, &destination).await?;
+                println!("uploaded: {id}");
+            }
         }
         Command::Get {
+            recursive,
             target,
             source,
             destination,
         } => {
-            let id = transfer::get(&config, &target, &source, &destination).await?;
-            println!("downloaded: {id}");
+            if recursive {
+                directory::get_directory(&config, &target, &source, &destination).await?;
+                println!("directory downloaded");
+            } else {
+                let id = transfer::get(&config, &target, &source, &destination).await?;
+                println!("downloaded: {id}");
+            }
         }
         Command::Transfer { command } => match command {
             TransferCommand::List { json } => {
@@ -313,7 +330,7 @@ async fn probe_routes(config: &Config, target: Option<&str>) -> Vec<RouteStatus>
                 Err(error) => RouteStatus {
                     route: route.name,
                     target: route.target,
-                    state: "DOWN".into(),
+                    state: transport::failure_state(&error).into(),
                     connect_ms: None,
                     error: Some(format!("{error:#}")),
                     hops: route.hops,
@@ -331,7 +348,7 @@ async fn probe_routes(config: &Config, target: Option<&str>) -> Vec<RouteStatus>
 }
 
 async fn ssh(config: &Config, target: &str) -> Result<()> {
-    let routes = config.routes_for(target);
+    let mut routes = config.routes_for(target);
     if routes.is_empty() {
         bail!("no route to target {target}");
     }
@@ -348,7 +365,17 @@ async fn ssh(config: &Config, target: &str) -> Result<()> {
                     Err(error) => eprintln!("shell disconnected: {error:#}; reconnecting..."),
                 }
             }
-            Err(error) => eprintln!("route {} failed: {error:#}", route.name),
+            Err(error) => {
+                eprintln!("route {} failed: {error:#}", route.name);
+                if transport::is_permanent(&error) {
+                    routes.retain(|candidate| candidate.name != route.name);
+                    if routes.is_empty() {
+                        bail!(
+                            "all routes to {target} have permanent authentication or host-key errors"
+                        );
+                    }
+                }
+            }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }

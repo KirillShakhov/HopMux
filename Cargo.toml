@@ -8,6 +8,7 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 dirs = "6"
+filetime = "0.2"
 hex = "0.4"
 russh = { version = "0.65", default-features = false, features = ["ring", "flate2", "rsa"] }
 russh-sftp = "3"

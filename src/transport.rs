@@ -1,10 +1,12 @@
 use crate::config::{Config, Node, Route};
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use russh::{
     client,
     keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate},
 };
 use std::{
+    error::Error as StdError,
+    fmt,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -39,47 +41,99 @@ impl Connection {
     }
 }
 
+#[derive(Debug)]
+struct AuthenticationFailure {
+    node: String,
+}
+
+impl fmt::Display for AuthenticationFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "authentication failed at node {}", self.node)
+    }
+}
+impl StdError for AuthenticationFailure {}
+
+pub fn is_permanent(error: &anyhow::Error) -> bool {
+    failure_state(error) != "DOWN"
+}
+
+pub fn failure_state(error: &anyhow::Error) -> &'static str {
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<russh::Error>()
+            .is_some_and(|error| matches!(error, russh::Error::UnknownKey))
+    }) {
+        "HOST_KEY_MISMATCH"
+    } else if error
+        .chain()
+        .any(|cause| cause.is::<AuthenticationFailure>())
+    {
+        "AUTH_FAILED"
+    } else {
+        "DOWN"
+    }
+}
+
 async fn authenticate(handle: &mut client::Handle<HostKeyPin>, node: &Node) -> Result<()> {
+    let mut method_errors = Vec::new();
     if let Some(path) = &node.key_file {
-        let expanded = if let Some(rest) = path.strip_prefix("~/") {
-            dirs::home_dir()
-                .context("cannot find home directory")?
-                .join(rest)
-        } else {
-            path.into()
-        };
-        let passphrase = node
-            .key_passphrase_env
-            .as_ref()
-            .map(std::env::var)
-            .transpose()
-            .context("missing key passphrase environment variable")?;
-        let key = russh::keys::load_secret_key(&expanded, passphrase.as_deref())
-            .with_context(|| format!("cannot load key {}", expanded.display()))?;
-        let hash = handle.best_supported_rsa_hash().await?.flatten();
-        if handle
-            .authenticate_publickey(&node.user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
-            .await?
-            .success()
-        {
-            return Ok(());
+        let attempt: Result<bool> = async {
+            let expanded = if let Some(rest) = path.strip_prefix("~/") {
+                dirs::home_dir()
+                    .context("cannot find home directory")?
+                    .join(rest)
+            } else {
+                path.into()
+            };
+            let passphrase = node
+                .key_passphrase_env
+                .as_ref()
+                .map(std::env::var)
+                .transpose()
+                .context("missing key passphrase environment variable")?;
+            let key = russh::keys::load_secret_key(&expanded, passphrase.as_deref())
+                .with_context(|| format!("cannot load key {}", expanded.display()))?;
+            let hash = handle.best_supported_rsa_hash().await?.flatten();
+            Ok(handle
+                .authenticate_publickey(&node.user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
+                .await?
+                .success())
+        }
+        .await;
+        match attempt {
+            Ok(true) => return Ok(()),
+            Ok(false) => method_errors.push("key rejected".to_owned()),
+            Err(error) => method_errors.push(format!("key unavailable: {error:#}")),
         }
     }
-    if node.agent && authenticate_agent(handle, node).await? {
-        return Ok(());
+    if node.agent {
+        match authenticate_agent(handle, node).await {
+            Ok(true) => return Ok(()),
+            Ok(false) => method_errors.push("agent identities rejected".to_owned()),
+            Err(error) => method_errors.push(format!("agent unavailable: {error:#}")),
+        }
     }
     if let Some(name) = &node.password_env {
-        let password = std::env::var(name)
-            .with_context(|| format!("missing password environment variable {name}"))?;
-        if handle
-            .authenticate_password(&node.user, password)
-            .await?
-            .success()
-        {
-            return Ok(());
+        match std::env::var(name) {
+            Ok(password) => {
+                if handle
+                    .authenticate_password(&node.user, password)
+                    .await?
+                    .success()
+                {
+                    return Ok(());
+                }
+                method_errors.push("password rejected".to_owned());
+            }
+            Err(_) => {
+                method_errors.push(format!("password environment variable {name} is missing"))
+            }
         }
     }
-    bail!("authentication failed for {}@{}", node.user, node.host)
+    Err(anyhow::Error::new(AuthenticationFailure {
+        node: node.host.clone(),
+    })
+    .context(method_errors.join("; ")))
 }
 
 #[cfg(unix)]
@@ -111,7 +165,7 @@ async fn authenticate_agent(handle: &mut client::Handle<HostKeyPin>, node: &Node
 
 #[cfg(not(unix))]
 async fn authenticate_agent(_: &mut client::Handle<HostKeyPin>, _: &Node) -> Result<bool> {
-    bail!("ssh-agent authentication is supported on Linux")
+    anyhow::bail!("ssh-agent authentication is supported on Linux")
 }
 
 pub async fn connect(config: &Config, route: &Route) -> Result<Connection> {
@@ -171,4 +225,24 @@ pub async fn connect(config: &Config, route: &Route) -> Result<Connection> {
         handles,
         elapsed: started.elapsed(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permanent_errors_are_not_retried() {
+        assert!(is_permanent(&anyhow::Error::new(AuthenticationFailure {
+            node: "edge".into()
+        })));
+        assert!(is_permanent(
+            &anyhow::Error::new(AuthenticationFailure {
+                node: "edge".into()
+            })
+            .context("route one")
+        ));
+        assert!(is_permanent(&anyhow::Error::new(russh::Error::UnknownKey)));
+        assert!(!is_permanent(&anyhow::anyhow!("connection timed out")));
+    }
 }

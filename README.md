@@ -20,14 +20,16 @@ mssh doctor internal
 mssh ssh internal
 mssh put internal ./archive.tar /home/alice/archive.tar
 mssh get internal /home/alice/archive.tar ./archive.tar
+mssh put -r internal ./project /home/alice/project
+mssh get -r internal /home/alice/project ./project
 mssh transfer list
 mssh transfer resume UUID
 ```
 
 `mssh ssh` starts a fresh shell after a transport failure. Press Ctrl-] to force a reconnect. Exiting the remote shell normally exits the client. Remote processes and shell state are not preserved.
 
-Transfers use unique `.mssh-UUID.part` files and owner-only local journals under `~/.local/state/mssh/transfers`. Blocks are checked after upload; full files are checked with SHA-256 before publication. Uploads use multiple routes concurrently and retry outstanding blocks on surviving routes. Publishing a remote file requires the server's `hardlink@openssh.com` extension, which prevents overwriting an existing name; a verified temporary file is retained when that extension is unavailable. Downloads use a local hard link for the same no-overwrite guarantee. `transfer resume` rechecks source identity and rewrites blocks before the final hash. `transfer cancel` removes the local journal and leaves a remote temporary file for manual cleanup.
+Transfers use unique `.mssh-UUID.part` files and owner-only local journals under `~/.local/state/mssh/transfers`. Blocks are checked after upload; full files are checked with SHA-256 before publication. Uploads and downloads use multiple routes concurrently and retry outstanding blocks on surviving routes. Publishing a remote file requires the server's `hardlink@openssh.com` extension, which prevents overwriting an existing name; a verified temporary file is retained when that extension is unavailable. Downloads use a local hard link for the same no-overwrite guarantee. `transfer resume` rechecks source identity and rewrites blocks before the final hash. `transfer cancel` removes the local journal and leaves a temporary file for manual cleanup. Recursive transfers preserve regular files, empty directories, symbolic links, permissions, and modification times on Linux. A failed directory transfer may leave a partial destination tree; file journals can be resumed individually.
 
 ## Current limits
 
-This is a working prototype, not the v0.1 acceptance release. Directory recursion, detailed telemetry and route states, PTY resize propagation, and automated integration tests against multi-hop SSH/SFTP servers are pending. The client saves the last status result but not a history of measurements. Linux runtime behavior still needs testing with real servers. SSH host certificates are rejected until CA and principal validation can be configured.
+This is a working prototype, not the v0.1 acceptance release. Detailed telemetry and route states, PTY resize propagation, and automated integration tests against multi-hop SSH/SFTP servers are pending. The client saves the last status result but not a history of measurements. Linux runtime behavior still needs testing with real servers. SSH host certificates are rejected until CA and principal validation can be configured.

@@ -109,13 +109,13 @@ pub fn cancel(id: Uuid) -> Result<String> {
     Ok(journal.temporary)
 }
 
-async fn sftp(connection: &transport::Connection) -> Result<SftpSession> {
+pub(crate) async fn sftp(connection: &transport::Connection) -> Result<SftpSession> {
     let channel = connection.final_handle().channel_open_session().await?;
     channel.request_subsystem(true, "sftp").await?;
     Ok(SftpSession::new(channel.into_stream()).await?)
 }
 
-async fn connect_any(config: &Config, target: &str) -> Result<transport::Connection> {
+pub(crate) async fn connect_any(config: &Config, target: &str) -> Result<transport::Connection> {
     let mut last_error = None;
     for route in config.routes_for(target) {
         match transport::connect(config, route).await {
@@ -412,7 +412,12 @@ pub async fn get(config: &Config, target: &str, source: &str, destination: &Path
 }
 
 async fn process_get(config: &Config, journal: &mut Journal) -> Result<()> {
-    let routes = config.routes_for(&journal.target);
+    let mut routes: Vec<Route> = config
+        .routes_for(&journal.target)
+        .into_iter()
+        .take(config.settings.max_parallel_routes)
+        .cloned()
+        .collect();
     ensure!(!routes.is_empty(), "no route to target {}", journal.target);
     ensure!(
         !Path::new(&journal.destination).exists(),
@@ -422,49 +427,46 @@ async fn process_get(config: &Config, journal: &mut Journal) -> Result<()> {
         Path::new(&journal.temporary).exists(),
         "local temporary file is missing"
     );
-    for (index, done) in journal.complete.clone().into_iter().enumerate() {
-        if done {
-            continue;
+    let shared = Arc::new(Mutex::new(journal.clone()));
+    let config = Arc::new(config.clone());
+    loop {
+        let pending: Vec<usize> = shared
+            .lock()
+            .unwrap()
+            .complete
+            .iter()
+            .enumerate()
+            .filter_map(|(i, done)| (!done).then_some(i))
+            .collect();
+        if pending.is_empty() {
+            break;
         }
-        let route = routes[index % routes.len()];
-        let connection = transport::connect(config, route)
-            .await
-            .with_context(|| format!("chunk {index} via {}", route.name))?;
-        let sftp = sftp(&connection).await?;
-        let metadata = sftp.metadata(&journal.source).await?;
-        let mtime = metadata
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|t| t.as_secs());
         ensure!(
-            metadata.len() == journal.size && mtime == journal.source_mtime,
-            "remote source changed"
+            !routes.is_empty(),
+            "all routes failed; transfer can be resumed later"
         );
-        let offset = index as u64 * journal.chunk_size as u64;
-        let length = (journal.size - offset).min(journal.chunk_size as u64) as usize;
-        let mut remote = sftp.open(&journal.source).await?;
-        remote.seek(SeekFrom::Start(offset)).await?;
-        let mut buffer = vec![0u8; length];
-        remote.read_exact(&mut buffer).await?;
-        remote.close().await?;
-        let mut local = tokio::fs::OpenOptions::new()
-            .write(true)
-            .open(&journal.temporary)
-            .await?;
-        local.seek(SeekFrom::Start(offset)).await?;
-        local.write_all(&buffer).await?;
-        local.sync_all().await?;
-        journal.complete[index] = true;
-        save(journal)?;
-        eprintln!(
-            "{}: {}/{} chunks via {}",
-            journal.id,
-            index + 1,
-            journal.complete.len(),
-            route.name
-        );
+        let queue = Arc::new(Mutex::new(VecDeque::from(pending)));
+        let mut workers = tokio::task::JoinSet::new();
+        for route in routes.iter().cloned() {
+            let config = config.clone();
+            let shared = shared.clone();
+            let queue = queue.clone();
+            workers.spawn(async move {
+                let name = route.name.clone();
+                (name, get_worker(config, route, shared, queue).await)
+            });
+        }
+        let mut failed = Vec::new();
+        while let Some(result) = workers.join_next().await {
+            let (name, outcome) = result?;
+            if let Err(error) = outcome {
+                eprintln!("route {name}: {error:#}");
+                failed.push(name);
+            }
+        }
+        routes.retain(|r| !failed.contains(&r.name));
     }
+    *journal = shared.lock().unwrap().clone();
     let (size, sha256, _) = local_hash(Path::new(&journal.temporary)).await?;
     ensure!(
         size == journal.size && sha256 == journal.sha256,
@@ -476,5 +478,56 @@ async fn process_get(config: &Config, journal: &mut Journal) -> Result<()> {
     journal.published = true;
     save(journal)?;
     let _ = fs::remove_file(&journal.temporary);
+    Ok(())
+}
+
+async fn get_worker(
+    config: Arc<Config>,
+    route: Route,
+    shared: Arc<Mutex<Journal>>,
+    queue: Arc<Mutex<VecDeque<usize>>>,
+) -> Result<()> {
+    let connection = transport::connect(&config, &route).await?;
+    let sftp = sftp(&connection).await?;
+    let snapshot = shared.lock().unwrap().clone();
+    let metadata = sftp.metadata(&snapshot.source).await?;
+    let mtime = metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|t| t.as_secs());
+    ensure!(
+        metadata.len() == snapshot.size && mtime == snapshot.source_mtime,
+        "remote source changed"
+    );
+    let mut remote = sftp.open(&snapshot.source).await?;
+    let mut local = tokio::fs::OpenOptions::new()
+        .write(true)
+        .open(&snapshot.temporary)
+        .await?;
+    loop {
+        let Some(index) = queue.lock().unwrap().pop_front() else {
+            break;
+        };
+        let offset = index as u64 * snapshot.chunk_size as u64;
+        let length = (snapshot.size - offset).min(snapshot.chunk_size as u64) as usize;
+        remote.seek(SeekFrom::Start(offset)).await?;
+        let mut buffer = vec![0u8; length];
+        remote.read_exact(&mut buffer).await?;
+        local.seek(SeekFrom::Start(offset)).await?;
+        local.write_all(&buffer).await?;
+        local.sync_data().await?;
+        let mut journal = shared.lock().unwrap();
+        journal.complete[index] = true;
+        save(&journal)?;
+        eprintln!(
+            "{}: {}/{} chunks via {}",
+            journal.id,
+            journal.complete.iter().filter(|&&done| done).count(),
+            journal.complete.len(),
+            route.name
+        );
+    }
+    remote.close().await?;
     Ok(())
 }
