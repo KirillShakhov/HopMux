@@ -1,13 +1,11 @@
-name: Windows build
+name: Windows release build
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-  workflow_dispatch:
+  release:
+    types: [published]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -15,6 +13,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache Rust build
@@ -23,9 +23,12 @@ jobs:
         run: cargo test --locked
       - name: Build release binary
         run: cargo build --release --locked
-      - name: Upload Windows binary
-        uses: actions/upload-artifact@v7.0.2
-        with:
-          name: mssh-windows-x86_64
-          path: target/release/mssh.exe
-          if-no-files-found: error
+      - name: Package Windows binary
+        shell: pwsh
+        run: Compress-Archive -Path target/release/mssh.exe, LICENSE, README.md -DestinationPath mssh-windows-x86_64.zip
+      - name: Add Windows build to release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload $env:RELEASE_TAG mssh-windows-x86_64.zip --repo $env:GITHUB_REPOSITORY --clobber
