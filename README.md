@@ -45,4 +45,4 @@ cargo run -- --config /tmp/hopmux-stand/config.toml status --routes --details
 cargo run -- --config /tmp/hopmux-stand/config.toml ssh target
 ```
 
-The stand has been used to check three routes, multi-route upload and download, recursive transfers with an empty directory and symlink, resume after forced process termination, failover after an entrance stops, normal shell exit, and manual and automatic terminal reconnection. Separate physical networks and modem failures remain untested.
+The stand has been used to check three routes, multi-route upload and download, recursive transfers with an empty directory and symlink, resume after forced process termination, failover after an entrance stops, normal shell exit, manual and automatic terminal reconnection, cancellation of interrupted transfers, and a write failure that left the destination unpublished. Separate physical networks and modem failures remain untested.

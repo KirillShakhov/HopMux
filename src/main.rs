@@ -226,7 +226,7 @@ async fn run() -> Result<()> {
                 .into_iter()
                 .filter(|s| target.as_ref().is_none_or(|t| &s.target == t))
                 .collect();
-            if routes || target.is_some() {
+            if routes || details || target.is_some() {
                 print_route_statuses(&statuses, json, details)?;
             } else {
                 print_entry_statuses(&statuses, json)?;
@@ -314,15 +314,37 @@ async fn run() -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&journals)?);
                 } else {
                     for j in journals {
+                        let completed = j.complete.iter().filter(|&&done| done).count();
                         println!(
-                            "{} {:?} {} -> {} {}/{}",
+                            "{} {:?} {} -> {} {}/{} chunks ({:.1}%){}",
                             j.id,
                             j.direction,
                             j.source,
                             j.destination,
-                            j.complete.iter().filter(|&&done| done).count(),
-                            j.complete.len()
+                            completed,
+                            j.complete.len(),
+                            if j.complete.is_empty() {
+                                100.0
+                            } else {
+                                100.0 * completed as f64 / j.complete.len() as f64
+                            },
+                            if j.published {
+                                " [published]"
+                            } else if transfer::is_active(&j) {
+                                " [active]"
+                            } else {
+                                " [interrupted]"
+                            }
                         );
+                        for (route, stats) in &j.route_stats {
+                            println!(
+                                "  {route}: {} bytes, last {}, errors {}, reconnects {}",
+                                stats.bytes,
+                                format_rate(stats.last_bps),
+                                stats.errors,
+                                stats.reconnects
+                            );
+                        }
                     }
                 }
             }
