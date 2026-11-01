@@ -15,7 +15,7 @@ use tokio::{net::TcpStream, time::timeout};
 
 #[derive(Clone)]
 pub(crate) struct HostKeyPin {
-    fingerprint: String,
+    fingerprint: Option<String>,
 }
 
 impl client::Handler for HostKeyPin {
@@ -27,7 +27,9 @@ impl client::Handler for HostKeyPin {
     ) -> Result<bool, Self::Error> {
         // Certificate trust requires CA and principal validation; pins apply only to raw keys.
         Ok(key.certificate().is_none()
-            && key.public_key().fingerprint(Default::default()).to_string() == self.fingerprint)
+            && self.fingerprint.as_ref().is_none_or(|fingerprint| {
+                key.public_key().fingerprint(Default::default()).to_string() == *fingerprint
+            }))
     }
 }
 

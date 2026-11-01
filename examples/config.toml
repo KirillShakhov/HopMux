@@ -1,5 +1,7 @@
 # Copy to ~/.config/mssh/config.toml on Linux.
-# Obtain fingerprints over a trusted channel before using this file.
+# host_key is optional. Without it, SSH host keys are not verified.
+# To pin a node, obtain its fingerprint over a trusted channel and add:
+# host_key = "SHA256:..."
 
 [settings]
 connect_timeout_secs = 10
@@ -10,19 +12,16 @@ chunk_size = 1048576
 [nodes.edge_a]
 host = "edge-a.example.org"
 user = "alice"
-host_key = "SHA256:REPLACE_WITH_TRUSTED_EDGE_A_FINGERPRINT"
 key_file = "~/.ssh/id_ed25519"
 
 [nodes.edge_b]
 host = "edge-b.example.org"
 user = "alice"
-host_key = "SHA256:REPLACE_WITH_TRUSTED_EDGE_B_FINGERPRINT"
 agent = true
 
 [nodes.internal]
 host = "10.0.0.15"
 user = "alice"
-host_key = "SHA256:REPLACE_WITH_TRUSTED_INTERNAL_FINGERPRINT"
 password_env = "MSSH_INTERNAL_PASSWORD"
 
 [[routes]]

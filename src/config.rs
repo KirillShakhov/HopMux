@@ -61,7 +61,7 @@ pub struct Node {
     #[serde(default = "default_port")]
     pub port: u16,
     pub user: String,
-    pub host_key: String,
+    pub host_key: Option<String>,
     pub key_file: Option<String>,
     pub key_passphrase_env: Option<String>,
     pub password_env: Option<String>,
@@ -142,14 +142,15 @@ impl Config {
                 !id.is_empty() && !node.host.is_empty() && !node.user.is_empty(),
                 "node {id}: id, host and user are required"
             );
-            ensure!(
-                node.host_key.starts_with("SHA256:")
-                    && node
-                        .host_key
-                        .parse::<russh::keys::ssh_key::Fingerprint>()
-                        .is_ok(),
-                "node {id}: host_key must be a pinned SHA256 fingerprint"
-            );
+            if let Some(host_key) = &node.host_key {
+                ensure!(
+                    host_key.starts_with("SHA256:")
+                        && host_key
+                            .parse::<russh::keys::ssh_key::Fingerprint>()
+                            .is_ok(),
+                    "node {id}: host_key must be a SHA256 fingerprint"
+                );
+            }
             ensure!(
                 node.key_file.is_some() || node.password_env.is_some() || node.agent,
                 "node {id}: configure key_file, password_env or agent"
@@ -273,9 +274,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unpinned_host() {
+    fn accepts_missing_host_key() {
         let mut config = sample();
-        config.nodes.get_mut("edge").unwrap().host_key.clear();
+        config.nodes.get_mut("edge").unwrap().host_key = None;
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_invalid_host_key() {
+        let mut config = sample();
+        config.nodes.get_mut("edge").unwrap().host_key = Some("invalid".into());
         assert!(
             config
                 .validate()

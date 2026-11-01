@@ -1,6 +1,6 @@
 # MultiHop SSH (`mssh`) prototype
 
-Rust CLI for reaching a Linux host through explicitly configured SSH chains. Every hop uses a separate Russh connection inside the preceding hop's `direct-tcpip` channel. The client pins a SHA-256 host-key fingerprint for each logical node. Intermediate hosts need no extra software.
+Rust CLI for reaching a Linux host through explicitly configured SSH chains. Every hop uses a separate Russh connection inside the preceding hop's `direct-tcpip` channel. The client can pin a SHA-256 host-key fingerprint for each logical node. Intermediate hosts need no extra software.
 
 ## License
 
@@ -14,7 +14,7 @@ cargo build --release
 
 Publishing a GitHub Release runs the Linux and Windows release workflows. They test and build the tagged source, then attach `mssh-linux-x86_64.tar.gz` and `mssh-windows-x86_64.zip` to that release. Both archives include `examples/config.toml`. Draft releases do not trigger builds until published.
 
-Copy [the example](examples/config.toml) to `~/.config/mssh/config.toml` and replace every placeholder host-key fingerprint with one verified through a trusted channel. Passwords and key passphrases are read from named environment variables. On Linux, `agent = true` uses `SSH_AUTH_SOCK`.
+Copy [the example](examples/config.toml) to `~/.config/mssh/config.toml` and set the node addresses and credentials. `host_key` is optional; when omitted, the client accepts any raw SSH host key for that node and warns at startup. To verify server identity, set `host_key = "SHA256:..."` using a fingerprint obtained through a trusted channel. Passwords and key passphrases are read from named environment variables. On Linux, `agent = true` uses `SSH_AUTH_SOCK`.
 
 ```sh
 mssh config check

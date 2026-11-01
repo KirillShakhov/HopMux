@@ -178,6 +178,17 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
     let path = cli.config.unwrap_or(config::default_path()?);
     let config = Config::load(&path)?;
+    let unpinned: Vec<_> = config
+        .nodes
+        .iter()
+        .filter_map(|(id, node)| node.host_key.is_none().then_some(id.as_str()))
+        .collect();
+    if !unpinned.is_empty() {
+        eprintln!(
+            "warning: SSH host keys are not verified for nodes: {}",
+            unpinned.join(", ")
+        );
+    }
     match cli.command {
         Command::Config {
             command: ConfigCommand::Check,
