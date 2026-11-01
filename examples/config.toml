@@ -22,7 +22,7 @@ agent = true
 [nodes.internal]
 host = "10.0.0.15"
 user = "alice"
-password_env = "MSSH_INTERNAL_PASSWORD"
+password = "REPLACE_WITH_PASSWORD"
 
 [[routes]]
 name = "via-a"

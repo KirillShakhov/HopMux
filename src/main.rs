@@ -160,6 +160,7 @@ struct AuthStatus {
     key_file: Option<String>,
     key_available: bool,
     password_env: Option<String>,
+    password_inline: bool,
     password_available: bool,
     agent: bool,
     agent_available: bool,
@@ -382,10 +383,12 @@ fn auth_statuses(config: &Config) -> Vec<AuthStatus> {
                 };
                 expanded.is_some_and(|path| path.is_file())
             });
-            let password_available = node
-                .password_env
-                .as_ref()
-                .is_some_and(|name| std::env::var_os(name).is_some());
+            let password_inline = node.password.is_some();
+            let password_available = password_inline
+                || node
+                    .password_env
+                    .as_ref()
+                    .is_some_and(|name| std::env::var_os(name).is_some());
             let agent_available = node.agent
                 && cfg!(unix)
                 && std::env::var_os("SSH_AUTH_SOCK")
@@ -395,6 +398,7 @@ fn auth_statuses(config: &Config) -> Vec<AuthStatus> {
                 key_file: node.key_file.clone(),
                 key_available,
                 password_env: node.password_env.clone(),
+                password_inline,
                 password_available,
                 agent: node.agent,
                 agent_available,

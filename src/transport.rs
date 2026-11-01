@@ -123,22 +123,28 @@ async fn authenticate(handle: &mut client::Handle<HostKeyPin>, node: &Node) -> R
             Err(error) => method_errors.push(format!("agent unavailable: {error:#}")),
         }
     }
-    if let Some(name) = &node.password_env {
+    let password = if let Some(inline) = &node.password {
+        Some(inline.clone())
+    } else if let Some(name) = &node.password_env {
         match std::env::var(name) {
-            Ok(password) => {
-                if handle
-                    .authenticate_password(&node.user, password)
-                    .await?
-                    .success()
-                {
-                    return Ok(());
-                }
-                method_errors.push("password rejected".to_owned());
-            }
+            Ok(password) => Some(password),
             Err(_) => {
-                method_errors.push(format!("password environment variable {name} is missing"))
+                method_errors.push(format!("password environment variable {name} is missing"));
+                None
             }
         }
+    } else {
+        None
+    };
+    if let Some(password) = password {
+        if handle
+            .authenticate_password(&node.user, password)
+            .await?
+            .success()
+        {
+            return Ok(());
+        }
+        method_errors.push("password rejected".to_owned());
     }
     Err(anyhow::Error::new(AuthenticationFailure {
         node: node.host.clone(),

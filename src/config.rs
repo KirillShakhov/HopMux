@@ -54,7 +54,7 @@ impl Default for Settings {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Node {
     pub host: String,
@@ -65,8 +65,27 @@ pub struct Node {
     pub key_file: Option<String>,
     pub key_passphrase_env: Option<String>,
     pub password_env: Option<String>,
+    #[serde(skip_serializing)]
+    pub password: Option<String>,
     #[serde(default)]
     pub agent: bool,
+}
+
+impl std::fmt::Debug for Node {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Node")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("user", &self.user)
+            .field("host_key", &self.host_key)
+            .field("key_file", &self.key_file)
+            .field("key_passphrase_env", &self.key_passphrase_env)
+            .field("password_env", &self.password_env)
+            .field("password_configured", &self.password.is_some())
+            .field("agent", &self.agent)
+            .finish()
+    }
 }
 fn default_port() -> u16 {
     22
@@ -105,8 +124,20 @@ impl Config {
             canonical.display()
         );
         let contents = fs::read_to_string(&canonical)?;
-        let mut config: Config = toml::from_str(&contents)
-            .with_context(|| format!("invalid TOML in {}", canonical.display()))?;
+        let mut config: Config = toml::from_str(&contents).map_err(|error: toml::de::Error| {
+            let location = error.span().map_or(String::new(), |span| {
+                let line = contents.as_bytes()[..span.start.min(contents.len())]
+                    .iter()
+                    .filter(|&&byte| byte == b'\n')
+                    .count()
+                    + 1;
+                format!(" at line {line}")
+            });
+            anyhow::anyhow!(
+                "invalid TOML in {}{location}; check syntax and field types",
+                canonical.display()
+            )
+        })?;
         let includes = std::mem::take(&mut config.include);
         for include in includes {
             let child = Self::read_recursive(&canonical.parent().unwrap().join(include), seen)?;
@@ -152,9 +183,22 @@ impl Config {
                 );
             }
             ensure!(
-                node.key_file.is_some() || node.password_env.is_some() || node.agent,
-                "node {id}: configure key_file, password_env or agent"
+                node.key_file.is_some()
+                    || node.password_env.is_some()
+                    || node.password.is_some()
+                    || node.agent,
+                "node {id}: configure key_file, password, password_env or agent"
             );
+            ensure!(
+                node.password.is_none() || node.password_env.is_none(),
+                "node {id}: choose password or password_env, not both"
+            );
+            if let Some(password) = &node.password {
+                ensure!(
+                    !password.is_empty(),
+                    "node {id}: password must not be empty"
+                );
+            }
             for name in [&node.password_env, &node.key_passphrase_env]
                 .into_iter()
                 .flatten()
@@ -291,6 +335,50 @@ mod tests {
                 .to_string()
                 .contains("host_key")
         );
+    }
+
+    #[test]
+    fn inline_password_is_usable_and_redacted() {
+        let mut config = sample();
+        let node = config.nodes.get_mut("internal").unwrap();
+        node.password_env = None;
+        node.password = Some("private-test-password".into());
+        config.validate().unwrap();
+        assert!(!format!("{config:?}").contains("private-test-password"));
+        assert!(
+            !toml::to_string(&config)
+                .unwrap()
+                .contains("private-test-password")
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_password_sources() {
+        let mut config = sample();
+        config.nodes.get_mut("internal").unwrap().password = Some("secret".into());
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("choose password or password_env")
+        );
+    }
+
+    #[test]
+    fn parse_errors_do_not_reveal_inline_passwords() {
+        let path = std::env::temp_dir().join(format!("mssh-invalid-{}.toml", uuid::Uuid::new_v4()));
+        fs::write(
+            &path,
+            "[nodes.edge]\npassword = \"private-test-password\" invalid\n",
+        )
+        .unwrap();
+        let error = Config::load(&path).unwrap_err();
+        fs::remove_file(&path).unwrap();
+        let message = format!("{error:#}");
+        assert!(message.contains("invalid TOML"));
+        assert!(message.contains("line 2"));
+        assert!(!message.contains("private-test-password"));
     }
 
     #[test]
