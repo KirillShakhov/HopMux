@@ -25,7 +25,11 @@ jobs:
         run: cargo build --release --locked
       - name: Package Windows binary
         shell: pwsh
-        run: Compress-Archive -Path target/release/mssh.exe, LICENSE, README.md -DestinationPath mssh-windows-x86_64.zip
+        run: |
+          New-Item -ItemType Directory -Path mssh-windows-x86_64/examples -Force | Out-Null
+          Copy-Item target/release/mssh.exe, LICENSE, README.md mssh-windows-x86_64/
+          Copy-Item examples/config.toml mssh-windows-x86_64/examples/
+          Compress-Archive -Path mssh-windows-x86_64 -DestinationPath mssh-windows-x86_64.zip
       - name: Add Windows build to release
         shell: pwsh
         env:

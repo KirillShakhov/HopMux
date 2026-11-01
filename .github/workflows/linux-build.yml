@@ -25,8 +25,9 @@ jobs:
         run: cargo build --release --locked
       - name: Package Linux binary
         run: |
-          mkdir mssh-linux-x86_64
+          mkdir -p mssh-linux-x86_64/examples
           cp target/release/mssh LICENSE README.md mssh-linux-x86_64/
+          cp examples/config.toml mssh-linux-x86_64/examples/
           tar -czf mssh-linux-x86_64.tar.gz mssh-linux-x86_64
       - name: Add Linux build to release
         env:

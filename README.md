@@ -12,7 +12,7 @@ This project is licensed under the GNU General Public License version 3.0 only (
 cargo build --release
 ```
 
-Publishing a GitHub Release runs the Linux and Windows release workflows. They test and build the tagged source, then attach `mssh-linux-x86_64.tar.gz` and `mssh-windows-x86_64.zip` to that release. Draft releases do not trigger builds until published.
+Publishing a GitHub Release runs the Linux and Windows release workflows. They test and build the tagged source, then attach `mssh-linux-x86_64.tar.gz` and `mssh-windows-x86_64.zip` to that release. Both archives include `examples/config.toml`. Draft releases do not trigger builds until published.
 
 Copy [the example](examples/config.toml) to `~/.config/mssh/config.toml` and replace every placeholder host-key fingerprint with one verified through a trusted channel. Passwords and key passphrases are read from named environment variables. On Linux, `agent = true` uses `SSH_AUTH_SOCK`.
 
