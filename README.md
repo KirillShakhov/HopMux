@@ -2,6 +2,10 @@
 
 Rust CLI for reaching a Linux host through explicitly configured SSH chains. Every hop uses a separate Russh connection inside the preceding hop's `direct-tcpip` channel. The client pins a SHA-256 host-key fingerprint for each logical node. Intermediate hosts need no extra software.
 
+## License
+
+This project is licensed under the GNU General Public License version 3.0 only (`GPL-3.0-only`). See [LICENSE](LICENSE) for the full text.
+
 ## Build
 
 ```sh
