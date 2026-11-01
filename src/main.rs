@@ -8,7 +8,12 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use config::{Config, Route};
 use serde::{Deserialize, Serialize};
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 use tokio::{io::AsyncWriteExt, sync::Semaphore};
 use uuid::Uuid;
 
@@ -100,14 +105,53 @@ enum TransferCommand {
     },
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct RouteStatus {
     route: String,
     target: String,
     state: String,
     connect_ms: Option<u128>,
+    #[serde(default)]
+    rtt_ms: Option<u128>,
+    #[serde(default)]
+    checked_at_unix_ms: u128,
     error: Option<String>,
     hops: Vec<String>,
+    #[serde(default)]
+    hop_timings: Vec<transport::HopTiming>,
+    #[serde(default)]
+    last_success_unix_ms: Option<u128>,
+    #[serde(default)]
+    probe_errors: u64,
+    #[serde(default)]
+    probe_reconnects: u64,
+    #[serde(default)]
+    error_count: u64,
+    #[serde(default)]
+    reconnect_count: u64,
+    #[serde(default)]
+    transferred_bytes: u64,
+    #[serde(default)]
+    last_bps: Option<f64>,
+    #[serde(default)]
+    current_bps: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct EntryStatus {
+    entry: String,
+    state: String,
+    best_route: String,
+    route_count: usize,
+    up_routes: usize,
+    connect_ms: Option<u128>,
+    rtt_ms: Option<u128>,
+    last_success_unix_ms: Option<u128>,
+    transferred_bytes: u64,
+    last_bps: Option<f64>,
+    current_bps: Option<f64>,
+    error_count: u64,
+    reconnect_count: u64,
 }
 
 #[derive(Serialize)]
@@ -164,7 +208,7 @@ async fn run() -> Result<()> {
         }
         Command::Status {
             watch,
-            routes: _,
+            routes,
             target,
             details,
             cached,
@@ -173,7 +217,8 @@ async fn run() -> Result<()> {
             let statuses = if cached {
                 load_status()?
             } else {
-                let statuses = probe_routes(&config, target.as_deref()).await;
+                let mut statuses = probe_routes(&config, target.as_deref()).await;
+                enrich_statuses(&mut statuses)?;
                 save_status(&statuses)?;
                 statuses
             };
@@ -181,21 +226,10 @@ async fn run() -> Result<()> {
                 .into_iter()
                 .filter(|s| target.as_ref().is_none_or(|t| &s.target == t))
                 .collect();
-            if json {
-                println!("{}", serde_json::to_string_pretty(&statuses)?);
+            if routes || target.is_some() {
+                print_route_statuses(&statuses, json, details)?;
             } else {
-                for s in &statuses {
-                    println!(
-                        "{}: {} ({} ms){}",
-                        s.route,
-                        s.state,
-                        s.connect_ms.map_or("-".into(), |n| n.to_string()),
-                        s.error.as_ref().map_or("".into(), |e| format!(" — {e}"))
-                    );
-                    if details {
-                        println!("  {}", s.hops.join(" -> "));
-                    }
-                }
+                print_entry_statuses(&statuses, json)?;
             }
             if !watch || cached {
                 if statuses.iter().all(|s| s.state != "UP") {
@@ -206,7 +240,9 @@ async fn run() -> Result<()> {
             tokio::time::sleep(Duration::from_secs(config.settings.check_interval_secs)).await;
         },
         Command::Doctor { target, json } => {
-            let statuses = probe_routes(&config, Some(&target)).await;
+            let mut statuses = probe_routes(&config, Some(&target)).await;
+            enrich_statuses(&mut statuses)?;
+            save_status(&statuses)?;
             if statuses.is_empty() {
                 bail!("no route to target {target}");
             }
@@ -292,8 +328,8 @@ async fn run() -> Result<()> {
             }
             TransferCommand::Resume { id } => transfer::resume(&config, id).await?,
             TransferCommand::Cancel { id } => {
-                let temporary = transfer::cancel(id)?;
-                println!("cancelled {id}; temporary file retained at {temporary}");
+                transfer::cancel(&config, id).await?;
+                println!("cancelled {id}");
             }
         },
     }
@@ -335,6 +371,181 @@ fn auth_statuses(config: &Config) -> Vec<AuthStatus> {
         .collect()
 }
 
+fn enrich_statuses(statuses: &mut [RouteStatus]) -> Result<()> {
+    let previous: BTreeMap<_, _> = load_status()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|status| (status.route.clone(), status))
+        .collect();
+    let journals = transfer::list()?;
+    for status in statuses {
+        if let Some(old) = previous.get(&status.route) {
+            status.probe_errors = old.probe_errors;
+            status.probe_reconnects = old.probe_reconnects;
+            status.last_success_unix_ms = old.last_success_unix_ms;
+            if status.state == "UP" && old.state != "UP" {
+                status.probe_reconnects = status.probe_reconnects.saturating_add(1);
+            }
+        }
+        if status.state == "UP" {
+            status.last_success_unix_ms = Some(status.checked_at_unix_ms);
+        } else {
+            status.probe_errors = status.probe_errors.saturating_add(1);
+        }
+        status.error_count = status.probe_errors;
+        status.reconnect_count = status.probe_reconnects;
+        let mut last_measurement = 0;
+        for journal in &journals {
+            if journal.target != status.target {
+                continue;
+            }
+            let Some(stats) = journal.route_stats.get(&status.route) else {
+                continue;
+            };
+            status.transferred_bytes = status.transferred_bytes.saturating_add(stats.bytes);
+            status.error_count = status.error_count.saturating_add(stats.errors);
+            status.reconnect_count = status.reconnect_count.saturating_add(stats.reconnects);
+            if stats.last_at_unix_ms > last_measurement {
+                last_measurement = stats.last_at_unix_ms;
+                status.last_bps = stats.last_bps;
+            }
+            if transfer::is_active(journal)
+                && status
+                    .checked_at_unix_ms
+                    .saturating_sub(stats.last_at_unix_ms)
+                    <= 5_000
+            {
+                status.current_bps =
+                    Some(status.current_bps.unwrap_or(0.0) + stats.last_bps.unwrap_or(0.0));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn entry_statuses(routes: &[RouteStatus]) -> Vec<EntryStatus> {
+    let mut groups: BTreeMap<String, Vec<&RouteStatus>> = BTreeMap::new();
+    for route in routes {
+        if let Some(entry) = route.hops.first() {
+            groups.entry(entry.clone()).or_default().push(route);
+        }
+    }
+    groups
+        .into_iter()
+        .filter_map(|(entry, group)| {
+            let best = group
+                .iter()
+                .copied()
+                .filter(|s| s.state == "UP")
+                .min_by_key(|s| {
+                    (
+                        s.rtt_ms.unwrap_or(u128::MAX),
+                        s.connect_ms.unwrap_or(u128::MAX),
+                    )
+                })
+                .or_else(|| group.first().copied())?;
+            let sum_rates = |values: Vec<Option<f64>>| {
+                let present: Vec<f64> = values.into_iter().flatten().collect();
+                (!present.is_empty()).then_some(present.iter().sum())
+            };
+            Some(EntryStatus {
+                entry,
+                state: best.state.clone(),
+                best_route: best.route.clone(),
+                route_count: group.len(),
+                up_routes: group.iter().filter(|s| s.state == "UP").count(),
+                connect_ms: best.connect_ms,
+                rtt_ms: best.rtt_ms,
+                last_success_unix_ms: group.iter().filter_map(|s| s.last_success_unix_ms).max(),
+                transferred_bytes: group
+                    .iter()
+                    .fold(0u64, |total, s| total.saturating_add(s.transferred_bytes)),
+                last_bps: sum_rates(group.iter().map(|s| s.last_bps).collect()),
+                current_bps: sum_rates(group.iter().map(|s| s.current_bps).collect()),
+                error_count: group
+                    .iter()
+                    .fold(0u64, |total, s| total.saturating_add(s.error_count)),
+                reconnect_count: group
+                    .iter()
+                    .fold(0u64, |total, s| total.saturating_add(s.reconnect_count)),
+            })
+        })
+        .collect()
+}
+
+fn format_rate(rate: Option<f64>) -> String {
+    rate.map_or("-".into(), |bps| format!("{:.1} KiB/s", bps / 1024.0))
+}
+
+fn checked_age(checked_at_unix_ms: u128) -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .saturating_sub(checked_at_unix_ms)
+        / 1000
+}
+
+fn print_route_statuses(statuses: &[RouteStatus], json: bool, details: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(statuses)?);
+    } else {
+        for s in statuses {
+            println!(
+                "{}: {} | connect {} ms, RTT {} ms | last {} | {} bytes | errors {}, reconnects {}{}",
+                s.route,
+                s.state,
+                s.connect_ms.map_or("-".into(), |n| n.to_string()),
+                s.rtt_ms.map_or("-".into(), |n| n.to_string()),
+                format_rate(s.last_bps),
+                s.transferred_bytes,
+                s.error_count,
+                s.reconnect_count,
+                s.error.as_ref().map_or("".into(), |e| format!(" — {e}"))
+            );
+            if details {
+                for hop in &s.hop_timings {
+                    println!("  {}: {} ms", hop.node, hop.connect_ms);
+                }
+                if s.hop_timings.is_empty() {
+                    println!("  {}", s.hops.join(" -> "));
+                }
+                if let Some(last) = s.last_success_unix_ms {
+                    println!("  last success: {} s ago", checked_age(last));
+                }
+                if let Some(current) = s.current_bps {
+                    println!("  current speed: {}", format_rate(Some(current)));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_entry_statuses(statuses: &[RouteStatus], json: bool) -> Result<()> {
+    let entries = entry_statuses(statuses);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+    } else {
+        for entry in entries {
+            println!(
+                "{}: {} ({}/{} routes, best {}) | RTT {} ms | last {} | {} bytes | errors {}, reconnects {}",
+                entry.entry,
+                entry.state,
+                entry.up_routes,
+                entry.route_count,
+                entry.best_route,
+                entry.rtt_ms.map_or("-".into(), |n| n.to_string()),
+                format_rate(entry.last_bps),
+                entry.transferred_bytes,
+                entry.error_count,
+                entry.reconnect_count
+            );
+        }
+    }
+    Ok(())
+}
+
 fn status_path() -> Result<PathBuf> {
     Ok(dirs::state_dir()
         .or_else(|| dirs::home_dir().map(|p| p.join(".local/state")))
@@ -363,7 +574,17 @@ fn save_status(statuses: &[RouteStatus]) -> Result<()> {
     }
     use std::io::Write;
     let mut file = options.open(&temporary)?;
-    file.write_all(&serde_json::to_vec_pretty(statuses)?)?;
+    let mut merged: BTreeMap<_, _> = load_status()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|status| (status.route.clone(), status))
+        .collect();
+    for status in statuses {
+        merged.insert(status.route.clone(), status.clone());
+    }
+    file.write_all(&serde_json::to_vec_pretty(
+        &merged.into_values().collect::<Vec<_>>(),
+    )?)?;
     file.sync_all()?;
     std::fs::rename(temporary, path)?;
     Ok(())
@@ -391,22 +612,69 @@ async fn probe_routes(config: &Config, target: Option<&str>) -> Vec<RouteStatus>
         tasks.push(tokio::spawn(async move {
             let _permit = semaphore.acquire().await.expect("semaphore closed");
             let result = transport::connect(&shared, &route).await;
+            let checked_at_unix_ms = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
             match result {
-                Ok(conn) => RouteStatus {
-                    route: route.name,
-                    target: route.target,
-                    state: "UP".into(),
-                    connect_ms: Some(conn.elapsed.as_millis()),
-                    error: None,
-                    hops: route.hops,
-                },
+                Ok(conn) => {
+                    let start = Instant::now();
+                    let ping = tokio::time::timeout(
+                        Duration::from_secs(shared.settings.connect_timeout_secs),
+                        conn.final_handle().send_ping(),
+                    )
+                    .await;
+                    let (state, rtt_ms, error) = match ping {
+                        Ok(Ok(())) => ("UP".to_owned(), Some(start.elapsed().as_millis()), None),
+                        Ok(Err(error)) => (
+                            "STALLED".to_owned(),
+                            None,
+                            Some(format!("SSH ping failed: {error}")),
+                        ),
+                        Err(_) => (
+                            "STALLED".to_owned(),
+                            None,
+                            Some("SSH ping timed out".to_owned()),
+                        ),
+                    };
+                    RouteStatus {
+                        route: route.name,
+                        target: route.target,
+                        state,
+                        connect_ms: Some(conn.elapsed.as_millis()),
+                        rtt_ms,
+                        checked_at_unix_ms,
+                        error,
+                        hops: route.hops,
+                        hop_timings: conn.hop_timings,
+                        last_success_unix_ms: None,
+                        probe_errors: 0,
+                        probe_reconnects: 0,
+                        error_count: 0,
+                        reconnect_count: 0,
+                        transferred_bytes: 0,
+                        last_bps: None,
+                        current_bps: None,
+                    }
+                }
                 Err(error) => RouteStatus {
                     route: route.name,
                     target: route.target,
                     state: transport::failure_state(&error).into(),
                     connect_ms: None,
+                    rtt_ms: None,
+                    checked_at_unix_ms,
                     error: Some(format!("{error:#}")),
                     hops: route.hops,
+                    hop_timings: Vec::new(),
+                    last_success_unix_ms: None,
+                    probe_errors: 0,
+                    probe_reconnects: 0,
+                    error_count: 0,
+                    reconnect_count: 0,
+                    transferred_bytes: 0,
+                    last_bps: None,
+                    current_bps: None,
                 },
             }
         }));

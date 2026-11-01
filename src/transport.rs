@@ -4,6 +4,7 @@ use russh::{
     client,
     keys::{PrivateKeyWithHashAlg, PublicKeyOrCertificate},
 };
+use serde::{Deserialize, Serialize};
 use std::{
     error::Error as StdError,
     fmt,
@@ -33,6 +34,13 @@ impl client::Handler for HostKeyPin {
 pub struct Connection {
     handles: Vec<client::Handle<HostKeyPin>>,
     pub elapsed: Duration,
+    pub hop_timings: Vec<HopTiming>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HopTiming {
+    pub node: String,
+    pub connect_ms: u128,
 }
 
 impl Connection {
@@ -177,7 +185,9 @@ pub async fn connect(config: &Config, route: &Route) -> Result<Connection> {
         ..Default::default()
     });
     let mut handles: Vec<client::Handle<HostKeyPin>> = Vec::new();
+    let mut hop_timings = Vec::new();
     for hop in &route.hops {
+        let hop_started = Instant::now();
         let node = &config.nodes[hop];
         let host = route.addresses.get(hop).unwrap_or(&node.host);
         let pin = HostKeyPin {
@@ -220,10 +230,15 @@ pub async fn connect(config: &Config, route: &Route) -> Result<Connection> {
             .context("authentication timed out")?
             .with_context(|| format!("at node {hop} on route {}", route.name))?;
         handles.push(handle);
+        hop_timings.push(HopTiming {
+            node: hop.clone(),
+            connect_ms: hop_started.elapsed().as_millis(),
+        });
     }
     Ok(Connection {
         handles,
         elapsed: started.elapsed(),
+        hop_timings,
     })
 }
 
