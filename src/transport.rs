@@ -207,35 +207,45 @@ pub async fn connect(config: &Config, route: &Route) -> Result<Connection> {
                 parent.channel_open_direct_tcpip(host.clone(), node.port as u32, "127.0.0.1", 0),
             )
             .await
-            .context("TCP forwarding timed out")?
+            .with_context(|| {
+                format!("TCP forwarding timed out at node {hop} on route {}", route.name)
+            })?
             .with_context(|| format!("TCP forwarding refused for node {hop}"))?;
             timeout(
                 duration,
                 client::connect_stream(ssh_config.clone(), channel.into_stream(), pin),
             )
             .await
-            .context("SSH handshake timed out")?
+            .with_context(|| {
+                format!("SSH handshake timed out at node {hop} on route {}", route.name)
+            })?
             .with_context(|| {
                 format!("SSH handshake failed at node {hop} on route {}", route.name)
             })?
         } else {
             let stream = timeout(duration, TcpStream::connect((host.as_str(), node.port)))
                 .await
-                .context("TCP connection timed out")?
+                .with_context(|| {
+                    format!("TCP connection timed out at node {hop} on route {}", route.name)
+                })?
                 .with_context(|| format!("TCP connection failed for node {hop}"))?;
             timeout(
                 duration,
                 client::connect_stream(ssh_config.clone(), stream, pin),
             )
             .await
-            .context("SSH handshake timed out")?
+            .with_context(|| {
+                format!("SSH handshake timed out at node {hop} on route {}", route.name)
+            })?
             .with_context(|| {
                 format!("SSH handshake failed at node {hop} on route {}", route.name)
             })?
         };
         timeout(duration, authenticate(&mut handle, node))
             .await
-            .context("authentication timed out")?
+            .with_context(|| {
+                format!("authentication timed out at node {hop} on route {}", route.name)
+            })?
             .with_context(|| format!("at node {hop} on route {}", route.name))?;
         handles.push(handle);
         hop_timings.push(HopTiming {

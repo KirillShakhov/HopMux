@@ -17,6 +17,8 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
+const MAX_ROUTE_ATTEMPTS: u32 = 3;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Journal {
     pub id: Uuid,
@@ -87,6 +89,10 @@ fn note_error(shared: &Arc<Mutex<Journal>>, route: &str) -> Result<()> {
     let stats = journal.route_stats.entry(route.to_owned()).or_default();
     stats.errors = stats.errors.saturating_add(1);
     save(&journal)
+}
+
+fn retry_route(error: &anyhow::Error, attempts: u32) -> bool {
+    !transport::is_permanent(error) && attempts < MAX_ROUTE_ATTEMPTS
 }
 
 fn note_chunk(
@@ -324,6 +330,7 @@ async fn process_put(config: &Config, journal: &mut Journal) -> Result<()> {
     ensure!(!routes.is_empty(), "no route to target {}", journal.target);
     let shared = Arc::new(Mutex::new(journal.clone()));
     let config = Arc::new(config.clone());
+    let mut failures = BTreeMap::<String, u32>::new();
     loop {
         let pending: Vec<usize> = shared
             .lock()
@@ -357,10 +364,18 @@ async fn process_put(config: &Config, journal: &mut Journal) -> Result<()> {
             if let Err(error) = outcome {
                 eprintln!("route {name}: {error:#}");
                 note_error(&shared, &name)?;
-                failed.push(name);
+                let attempts = failures.entry(name.clone()).or_default();
+                *attempts += 1;
+                if !retry_route(&error, *attempts) {
+                    failed.push(name);
+                }
             }
         }
         routes.retain(|r| !failed.contains(&r.name));
+        if !routes.is_empty() && shared.lock().unwrap().complete.iter().any(|&done| !done) {
+            let attempts = failures.values().copied().max().unwrap_or(0);
+            tokio::time::sleep(Duration::from_secs(u64::from(attempts.min(2)))).await;
+        }
     }
     *journal = shared.lock().unwrap().clone();
     let connection = connect_any(&config, &journal.target).await?;
@@ -445,9 +460,8 @@ pub async fn resume(config: &Config, id: Uuid) -> Result<()> {
     ensure!(!journal.published, "transfer already published");
     ensure!(!is_active(&journal), "transfer is still active");
     journal.owner_pid = std::process::id();
-    // A chunk marked complete may have been changed after a crash. Rewriting the
-    // immutable source bytes is safe and makes the final digest meaningful.
-    journal.complete.fill(false);
+    // Completed chunks have been written (and uploads read back) before being
+    // recorded. Keep them on resume; the full-file digest checks the result.
     save(&journal)?;
     match journal.direction {
         Direction::Put => process_put(config, &mut journal).await,
@@ -536,6 +550,7 @@ async fn process_get(config: &Config, journal: &mut Journal) -> Result<()> {
     );
     let shared = Arc::new(Mutex::new(journal.clone()));
     let config = Arc::new(config.clone());
+    let mut failures = BTreeMap::<String, u32>::new();
     loop {
         let pending: Vec<usize> = shared
             .lock()
@@ -569,10 +584,18 @@ async fn process_get(config: &Config, journal: &mut Journal) -> Result<()> {
             if let Err(error) = outcome {
                 eprintln!("route {name}: {error:#}");
                 note_error(&shared, &name)?;
-                failed.push(name);
+                let attempts = failures.entry(name.clone()).or_default();
+                *attempts += 1;
+                if !retry_route(&error, *attempts) {
+                    failed.push(name);
+                }
             }
         }
         routes.retain(|r| !failed.contains(&r.name));
+        if !routes.is_empty() && shared.lock().unwrap().complete.iter().any(|&done| !done) {
+            let attempts = failures.values().copied().max().unwrap_or(0);
+            tokio::time::sleep(Duration::from_secs(u64::from(attempts.min(2)))).await;
+        }
     }
     *journal = shared.lock().unwrap().clone();
     let (size, sha256, _) = local_hash(Path::new(&journal.temporary)).await?;
@@ -631,4 +654,18 @@ async fn get_worker(
     }
     remote.close().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_failures_get_bounded_retries() {
+        let timeout = anyhow::anyhow!("connection timed out");
+        assert!(retry_route(&timeout, 1));
+        assert!(retry_route(&timeout, 2));
+        assert!(!retry_route(&timeout, 3));
+        assert!(!retry_route(&anyhow::Error::new(russh::Error::UnknownKey), 1));
+    }
 }
