@@ -196,12 +196,12 @@ async fn run() -> Result<()> {
         } => println!(
             "config OK: {} nodes, {} routes",
             config.nodes.len(),
-            config.routes.len()
+            config.effective_routes().len()
         ),
         Command::Routes { target, json } => {
             let routes: Vec<_> = config
-                .routes
-                .iter()
+                .effective_routes()
+                .into_iter()
                 .filter(|r| target.as_ref().is_none_or(|t| &r.target == t))
                 .collect();
             if json {
@@ -635,10 +635,9 @@ fn load_status() -> Result<Vec<RouteStatus>> {
 
 async fn probe_routes(config: &Config, target: Option<&str>) -> Vec<RouteStatus> {
     let routes: Vec<Route> = config
-        .routes
-        .iter()
+        .effective_routes()
+        .into_iter()
         .filter(|r| !r.disabled && target.is_none_or(|t| r.target == t))
-        .cloned()
         .collect();
     let shared = Arc::new(config.clone());
     let semaphore = Arc::new(Semaphore::new(config.settings.max_parallel_routes));
@@ -732,9 +731,9 @@ async fn ssh(config: &Config, target: &str) -> Result<()> {
     }
     let mut index = 0;
     loop {
-        let route = routes[index % routes.len()];
+        let route = routes[index % routes.len()].clone();
         index += 1;
-        match transport::connect(config, route).await {
+        match transport::connect(config, &route).await {
             Ok(connection) => {
                 eprintln!("connected via {} (Ctrl-] to reconnect)", route.name);
                 match shell(&connection).await {

@@ -155,7 +155,7 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
-        ensure!(!self.routes.is_empty(), "no routes configured");
+        ensure!(!self.nodes.is_empty(), "no nodes configured");
         ensure!(
             self.settings.connect_timeout_secs > 0 && self.settings.check_interval_secs > 0,
             "timeouts and check intervals must be positive"
@@ -245,15 +245,44 @@ impl Config {
                 );
             }
         }
-        if self.routes.iter().all(|r| r.disabled) {
+        if self.effective_routes().iter().all(|r| r.disabled) {
             bail!("all routes are disabled");
         }
         Ok(())
     }
 
-    pub fn routes_for<'a>(&'a self, target: &str) -> Vec<&'a Route> {
-        self.routes
-            .iter()
+    /// Nodes without a configured route can be reached directly. Explicit
+    /// routes (including disabled ones) take precedence over this fallback.
+    pub fn effective_routes(&self) -> Vec<Route> {
+        let mut routes = self.routes.clone();
+        let mut names: BTreeSet<String> = routes.iter().map(|r| r.name.clone()).collect();
+        for id in self.nodes.keys() {
+            if routes.iter().any(|r| r.target == *id) {
+                continue;
+            }
+            let base = format!("direct:{id}");
+            let mut name = base.clone();
+            let mut suffix = 2;
+            while names.contains(&name) {
+                name = format!("{base}:{suffix}");
+                suffix += 1;
+            }
+            names.insert(name.clone());
+            routes.push(Route {
+                name,
+                target: id.clone(),
+                hops: vec![id.clone()],
+                priority: 0,
+                disabled: false,
+                addresses: BTreeMap::new(),
+            });
+        }
+        routes
+    }
+
+    pub fn routes_for(&self, target: &str) -> Vec<Route> {
+        self.effective_routes()
+            .into_iter()
             .filter(|r| !r.disabled && r.target == target)
             .collect()
     }
@@ -294,6 +323,57 @@ mod tests {
     #[test]
     fn accepts_valid_chain() {
         sample().validate().unwrap();
+    }
+
+    #[test]
+    fn entry_node_without_route_connects_directly() {
+        let config = sample();
+        let routes = config.routes_for("edge");
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].hops, ["edge"]);
+        assert_eq!(routes[0].name, "direct:edge");
+        assert_eq!(config.routes_for("internal")[0].hops, ["edge", "internal"]);
+        assert!(config.routes_for("missing").is_empty());
+    }
+
+    #[test]
+    fn nodes_only_configuration_is_valid() {
+        let mut config = sample();
+        config.routes.clear();
+        config.validate().unwrap();
+        assert_eq!(config.routes_for("internal")[0].hops, ["internal"]);
+    }
+
+    #[test]
+    fn disabled_route_does_not_become_direct() {
+        let mut config = sample();
+        config.routes[0].disabled = true;
+        config.validate().unwrap(); // the entry node still has a direct route
+        assert!(config.routes_for("internal").is_empty());
+    }
+
+    #[test]
+    fn explicit_entry_route_overrides_direct_fallback() {
+        let mut config = sample();
+        config.routes.push(Route {
+            name: "via-other".into(),
+            target: "edge".into(),
+            hops: vec!["internal".into(), "edge".into()],
+            priority: 0,
+            disabled: false,
+            addresses: BTreeMap::new(),
+        });
+        config.validate().unwrap();
+        assert_eq!(config.routes_for("edge")[0].name, "via-other");
+        assert_eq!(config.routes_for("edge").len(), 1);
+    }
+
+    #[test]
+    fn generated_names_do_not_collide_with_explicit_routes() {
+        let mut config = sample();
+        config.routes[0].name = "direct:edge".into();
+        config.validate().unwrap();
+        assert_eq!(config.routes_for("edge")[0].name, "direct:edge:2");
     }
 
     #[test]

@@ -16,6 +16,8 @@ Publishing a GitHub Release runs the Linux and Windows release workflows. They t
 
 Copy [the example](examples/config.toml) to `~/.config/mssh/config.toml` and set the node addresses and credentials. `host_key` is optional; when omitted, the client accepts any raw SSH host key for that node and warns at startup. To verify server identity, set `host_key = "SHA256:..."` using a fingerprint obtained through a trusted channel. A node can use `password = "..."` directly or `password_env = "VARIABLE_NAME"`; do not set both. An inline password is stored as plain text, so restrict access to the config file and do not commit a real password. Key passphrases are read from named environment variables. On Linux, `agent = true` uses `SSH_AUTH_SOCK`.
 
+You do not need a `[[routes]]` entry to connect to an entry node: if a node has no explicit route to it, `mssh` tries it directly using its configured host and port. This also works with configs containing only `[nodes]`. Explicit routes take precedence; a disabled explicit route does not fall back to a direct connection. Automatically generated routes appear as `direct:NODE` in `mssh routes` and `mssh status`.
+
 ```sh
 mssh config check
 mssh routes --target internal
@@ -25,6 +27,7 @@ mssh status --cached
 mssh doctor internal
 mssh auth --check
 mssh ssh internal
+mssh ssh edge_a
 mssh put internal ./archive.tar /home/alice/archive.tar
 mssh get internal /home/alice/archive.tar ./archive.tar
 mssh put -r internal ./project /home/alice/project

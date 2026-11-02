@@ -231,7 +231,7 @@ pub(crate) async fn sftp(connection: &transport::Connection) -> Result<SftpSessi
 pub(crate) async fn connect_any(config: &Config, target: &str) -> Result<transport::Connection> {
     let mut last_error = None;
     for route in config.routes_for(target) {
-        match transport::connect(config, route).await {
+        match transport::connect(config, &route).await {
             Ok(connection) => return Ok(connection),
             Err(error) => last_error = Some(error),
         }
@@ -325,7 +325,6 @@ async fn process_put(config: &Config, journal: &mut Journal) -> Result<()> {
         .routes_for(&journal.target)
         .into_iter()
         .take(config.settings.max_parallel_routes)
-        .cloned()
         .collect();
     ensure!(!routes.is_empty(), "no route to target {}", journal.target);
     let shared = Arc::new(Mutex::new(journal.clone()));
@@ -537,7 +536,6 @@ async fn process_get(config: &Config, journal: &mut Journal) -> Result<()> {
         .routes_for(&journal.target)
         .into_iter()
         .take(config.settings.max_parallel_routes)
-        .cloned()
         .collect();
     ensure!(!routes.is_empty(), "no route to target {}", journal.target);
     ensure!(
