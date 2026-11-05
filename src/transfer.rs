@@ -92,6 +92,12 @@ pub struct RouteTransferStats {
     pub errors: u64,
     pub reconnects: u64,
     pub sessions: u64,
+    #[serde(default)]
+    pub connect_ms: u128,
+    #[serde(default)]
+    pub session_ms: u128,
+    #[serde(default)]
+    pub failed_session_ms: u128,
 }
 
 fn now_unix_ms() -> u128 {
@@ -101,7 +107,7 @@ fn now_unix_ms() -> u128 {
         .as_millis()
 }
 
-async fn note_session(shared: &Arc<Mutex<Journal>>, route: &str, sftp: &SftpSession) -> Result<()> {
+async fn note_session(shared: &Arc<Mutex<Journal>>, route: &str, connect: Duration, sftp: &SftpSession) -> Result<()> {
     let mut journal = shared.lock().await;
     journal.updated_at_unix_ms = now_unix_ms();
     let stats = journal.route_stats.entry(route.to_owned()).or_default();
@@ -109,7 +115,25 @@ async fn note_session(shared: &Arc<Mutex<Journal>>, route: &str, sftp: &SftpSess
         stats.reconnects = stats.reconnects.saturating_add(1);
     }
     stats.sessions = stats.sessions.saturating_add(1);
+    stats.connect_ms = stats.connect_ms.saturating_add(connect.as_millis());
     crate::debug_log!("transfer {}: route {} session opened", journal.id, route);
+    save(sftp, &journal).await
+}
+
+async fn note_worker_finished(
+    shared: &Arc<Mutex<Journal>>,
+    route: &str,
+    elapsed: Duration,
+    failed: bool,
+    sftp: &SftpSession,
+) -> Result<()> {
+    let mut journal = shared.lock().await;
+    let stats = journal.route_stats.entry(route.to_owned()).or_default();
+    stats.session_ms = stats.session_ms.saturating_add(elapsed.as_millis());
+    if failed {
+        stats.failed_session_ms = stats.failed_session_ms.saturating_add(elapsed.as_millis());
+    }
+    crate::debug_log!("transfer {}: route {} session ended after {} ms, failed={failed}", journal.id, route, elapsed.as_millis());
     save(sftp, &journal).await
 }
 
@@ -415,12 +439,15 @@ async fn process_put(config: &Config, journal: &mut Journal) -> Result<()> {
             let queue = queue.clone();
             workers.spawn(async move {
                 let name = route.name.clone();
-                (name, put_worker(config, route, shared, queue).await)
+                let started = Instant::now();
+                let result = put_worker(config, route, shared, queue).await;
+                (name, started.elapsed(), result)
             });
         }
         let mut failed = Vec::new();
         while let Some(result) = workers.join_next().await {
-            let (name, outcome) = result?;
+            let (name, elapsed, outcome) = result?;
+            note_worker_finished(&shared, &name, elapsed, outcome.is_err(), &control_sftp).await?;
             if let Err(error) = outcome {
                 crate::debug::write_stderr(format_args!("route {name}: {error:#}"));
                 note_error(&shared, &name, &error, &control_sftp).await?;
@@ -483,9 +510,10 @@ async fn put_worker(
     shared: Arc<Mutex<Journal>>,
     queue: Arc<Mutex<VecDeque<usize>>>,
 ) -> Result<()> {
+    let connect_started = Instant::now();
     let connection = transport::connect(&config, &route).await?;
     let sftp = sftp(&connection).await?;
-    note_session(&shared, &route.name, &sftp).await?;
+    note_session(&shared, &route.name, connect_started.elapsed(), &sftp).await?;
     let snapshot = shared.lock().await.clone();
     let mut local = tokio::fs::File::open(&snapshot.source).await?;
     loop {
@@ -658,12 +686,15 @@ async fn process_get(config: &Config, journal: &mut Journal) -> Result<()> {
             let queue = queue.clone();
             workers.spawn(async move {
                 let name = route.name.clone();
-                (name, get_worker(config, route, shared, queue).await)
+                let started = Instant::now();
+                let result = get_worker(config, route, shared, queue).await;
+                (name, started.elapsed(), result)
             });
         }
         let mut failed = Vec::new();
         while let Some(result) = workers.join_next().await {
-            let (name, outcome) = result?;
+            let (name, elapsed, outcome) = result?;
+            note_worker_finished(&shared, &name, elapsed, outcome.is_err(), &control_sftp).await?;
             if let Err(error) = outcome {
                 crate::debug::write_stderr(format_args!("route {name}: {error:#}"));
                 note_error(&shared, &name, &error, &control_sftp).await?;
@@ -703,9 +734,10 @@ async fn get_worker(
     shared: Arc<Mutex<Journal>>,
     queue: Arc<Mutex<VecDeque<usize>>>,
 ) -> Result<()> {
+    let connect_started = Instant::now();
     let connection = transport::connect(&config, &route).await?;
     let sftp = sftp(&connection).await?;
-    note_session(&shared, &route.name, &sftp).await?;
+    note_session(&shared, &route.name, connect_started.elapsed(), &sftp).await?;
     let snapshot = shared.lock().await.clone();
     let metadata = sftp.metadata(&snapshot.source).await?;
     let mtime = metadata

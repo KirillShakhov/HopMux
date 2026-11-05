@@ -172,7 +172,7 @@ async fn show_transfers(config: &Config, target: &str, json: bool) -> Result<()>
             let done = j.complete.iter().filter(|&&x| x).count();
             println!("{} {:?} {} -> {} {}/{} chunks{}", j.id, j.direction, j.source, j.destination, done, j.complete.len(), if j.published { " [done]" } else { " [partial]" });
             if let Some(error) = &j.last_error { println!("  error: {error}"); }
-            for (route, stats) in j.route_stats { println!("  {route}: {} bytes, errors {}, reconnects {}", stats.bytes, stats.errors, stats.reconnects); }
+            for (route, stats) in j.route_stats { println!("  {route}: {} bytes, connect {} ms, session {} ms, failed {} ms, errors {}, reconnects {}", stats.bytes, stats.connect_ms, stats.session_ms, stats.failed_session_ms, stats.errors, stats.reconnects); }
         }
     }
     Ok(())
@@ -216,7 +216,7 @@ async fn show_status(config: &Config, target: Option<&str>, json: bool, details:
                 println!("transfer {} on {}: {:?} {}/{} chunks{}", j.id, node, j.direction, done, j.complete.len(), if j.published { " [done]" } else { " [partial]" });
                 if let Some(error) = &j.last_error { println!("  error: {error}"); }
                 if details {
-                    for (route, stats) in j.route_stats { println!("  {route}: {} bytes, errors {}, reconnects {}", stats.bytes, stats.errors, stats.reconnects); }
+                    for (route, stats) in j.route_stats { println!("  {route}: {} bytes, connect {} ms, session {} ms, failed {} ms, errors {}, reconnects {}", stats.bytes, stats.connect_ms, stats.session_ms, stats.failed_session_ms, stats.errors, stats.reconnects); }
                 }
             }
         }
