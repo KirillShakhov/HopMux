@@ -11,12 +11,12 @@ cargo build --release
 To build and test in one reusable Docker container:
 
 ```sh
-docker compose up -d --build
-docker compose exec -T dev cargo test --locked
-docker compose exec -T dev cargo build --locked
+docker compose -f compose.dev.yaml up -d --build
+docker compose -f compose.dev.yaml exec -T dev cargo test --locked
+docker compose -f compose.dev.yaml exec -T dev cargo build --locked
 ```
 
-The Cargo registry and build output use persistent Docker volumes. After the first setup, run further checks with `docker compose exec` without rebuilding the image.
+The Cargo registry and build output use persistent Docker volumes. After the first setup, run further checks with `docker compose -f compose.dev.yaml exec` without rebuilding the image.
 
 Copy [the example](examples/config.toml) to `~/.config/mssh/config.toml`. Nodes can use a key, SSH agent, password, or a password environment variable. Set `host_key = "SHA256:..."` to pin a host key; unpinned nodes produce a warning. A node with no explicit route is reachable directly.
 
