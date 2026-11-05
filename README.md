@@ -1,59 +1,51 @@
-# MultiHop SSH (`mssh`) prototype
+# MultiHop SSH (`mssh`)
 
-Rust CLI for reaching a Linux host through explicitly configured SSH chains. Every hop uses a separate Russh connection inside the preceding hop's `direct-tcpip` channel. The client can pin a SHA-256 host-key fingerprint for each logical node. Intermediate hosts need no extra software.
+`mssh` connects to Linux hosts through configured SSH chains and copies files over SFTP. Each hop has its own SSH connection; intermediate hosts need no additional software. See [LICENSE](LICENSE) for GPL-3.0-only terms.
 
-## License
-
-This project is licensed under the GNU General Public License version 3.0 only (`GPL-3.0-only`). See [LICENSE](LICENSE) for the full text.
-
-## Build
+## Build and configuration
 
 ```sh
 cargo build --release
 ```
 
-Publishing a GitHub Release runs the Linux and Windows release workflows. They test and build the tagged source, then attach `mssh-linux-x86_64.tar.gz` and `mssh-windows-x86_64.zip` to that release. Both archives include `examples/config.toml`. Draft releases do not trigger builds until published.
-
-Copy [the example](examples/config.toml) to `~/.config/mssh/config.toml` and set the node addresses and credentials. `host_key` is optional; when omitted, the client accepts any raw SSH host key for that node and warns at startup. To verify server identity, set `host_key = "SHA256:..."` using a fingerprint obtained through a trusted channel. A node can use `password = "..."` directly or `password_env = "VARIABLE_NAME"`; do not set both. An inline password is stored as plain text, so restrict access to the config file and do not commit a real password. Key passphrases are read from named environment variables. On Linux, `agent = true` uses `SSH_AUTH_SOCK`.
-
-You do not need a `[[routes]]` entry to connect to an entry node: if a node has no explicit route to it, `mssh` tries it directly using its configured host and port. This also works with configs containing only `[nodes]`. Explicit routes take precedence; a disabled explicit route does not fall back to a direct connection. Automatically generated routes appear as `direct:NODE` in `mssh routes` and `mssh status`.
+To build and test in one reusable Docker container:
 
 ```sh
-mssh config check
-mssh routes --target internal
-mssh status --target internal --details
-mssh status --watch --json
-mssh status --cached
-mssh doctor internal
-mssh auth --check
-mssh ssh internal
-mssh ssh edge_a
-mssh put internal ./archive.tar /home/alice/archive.tar
-mssh get internal /home/alice/archive.tar ./archive.tar
-mssh put -r internal ./project /home/alice/project
-mssh get -r internal /home/alice/project ./project
-mssh transfer list
-mssh transfer resume UUID
-mssh transfer cancel UUID
+docker compose up -d --build
+docker compose exec -T dev cargo test --locked
+docker compose exec -T dev cargo build --locked
 ```
 
-`mssh ssh` starts a fresh shell after a transport failure. Press Ctrl-] to force a reconnect. Exiting the remote shell normally exits the client. Remote processes and shell state are not preserved.
+The Cargo registry and build output use persistent Docker volumes. After the first setup, run further checks with `docker compose exec` without rebuilding the image.
 
-Transfers use unique `.mssh-UUID.part` files and owner-only local journals under `~/.local/state/mssh/transfers`. Blocks are checked after upload; full files are checked with SHA-256 before publication. Uploads and downloads use multiple routes concurrently, retry transient route failures up to three times per run, and reassign outstanding blocks to available routes. Publishing a remote file requires the server's `hardlink@openssh.com` extension, which prevents overwriting an existing name; a verified temporary file is retained when that extension is unavailable. Downloads use a local hard link for the same no-overwrite guarantee. `transfer resume` keeps recorded completed blocks, rechecks the upload source identity, and checks the final file hash; if the temporary file was externally modified, verification fails without publishing it. `transfer cancel` removes an interrupted transfer's temporary file and journal after checking that the transfer is no longer running and the destination has not appeared. Recursive transfers preserve regular files, empty directories, symbolic links, permissions, and modification times on Linux. A failed directory transfer may leave a partial destination tree; file journals can be resumed individually.
+Copy [the example](examples/config.toml) to `~/.config/mssh/config.toml`. Nodes can use a key, SSH agent, password, or a password environment variable. Set `host_key = "SHA256:..."` to pin a host key; unpinned nodes produce a warning. A node with no explicit route is reachable directly.
 
-If transfer connections time out while an SSH shell works, run `mssh doctor TARGET` to see which route and hop fail. Try a larger `connect_timeout_secs` for slow hops or `max_parallel_routes = 1` if the SSH server limits simultaneous connections; then run `mssh transfer resume UUID` using the ID from `mssh transfer list`.
+## Commands
 
-## Current limits
+```sh
+mssh edge_a
+mssh edge_a:/home/niias/test.yml ./downloads/
+mssh ./download/test.yml edge_a:/home/niias
+mssh -r ./project edge_a:/home/niias
+mssh -d edge_a:/home/niias/test.yml ./downloads/
+mssh transfers edge_a
+mssh status edge_a --details
+mssh status --json
+mssh config check
+```
 
-This is a working prototype, not the v0.1 acceptance release. `status` reports route RTT, per-hop connection times, transfer rates and byte counts, and probe and transfer error counters. Transfer telemetry is retained in journals and disappears when a journal is deleted; the client saves the last status result but not a history of measurements. Route states and automated integration tests against separate multi-hop SSH/SFTP servers are still incomplete. SSH host certificates are rejected until CA and principal validation can be configured.
+Copying to an existing directory appends the source name, as with `scp`. Remote paths must be absolute. Use `-r` for directories. All available routes are used for file transfers by default; `--route NAME` selects a route and can be repeated. `--max-routes N` limits the number used concurrently, and `--chunk-size BYTES` sets the chunk size (64 KiB to 8 MiB).
+
+An interrupted file copy leaves a partial file and a journal under `~/.mssh/transfers` on the destination SSH server. For downloads, the journal is on the source SSH server and the local `.part` contains only downloaded file data. Repeat the same copy command to choose whether to continue or restart. For noninteractive use, pass `--continue-partial` or `--restart`. `-d` starts a detached transfer worker; it also accepts those two options when a partial transfer already exists. `mssh transfers TARGET` reads the remote journals. There is no local transfer journal or status cache.
+
+Uploads verify each written chunk and the final SHA-256 before publishing. Downloads verify the final SHA-256. Publishing does not overwrite an existing destination. Recursive copies preserve regular files, empty directories, symbolic links, permissions, and modification times on Linux.
+
+`status` probes routes and displays connection times, SSH round-trip times, hop timings with `--details`, and transfer progress from remote journals. `config check` validates the configuration. `mssh TARGET` opens an SSH shell and reconnects after a transport failure; Ctrl-] forces a reconnect.
+
+## Limits
+
+Background transfers need the client computer to stay running. A partial download can be continued only where its local `.part` file is available; on another computer it must be restarted. Remote state requires write access to the SSH account's home directory. Recursive directory copies cannot yet continue as one operation after an interruption; individual files have remote journals. SSH host certificates are rejected until CA and principal validation are configured.
 
 ## Local integration stand
 
-On Ubuntu WSL, run `tests/local-stand.sh` as root with the ordinary Linux username as its argument. The script downloads `openssh-server` and `libwrap0` into `/tmp/hopmux-stand`, creates an `sshd` privilege-separation account if necessary, and starts three loopback SSH servers on ports 37221–37223. It does not install the packages system-wide. It writes a pinned test configuration to `/tmp/hopmux-stand/config.toml` and a passwordless key for this disposable stand. Run `tests/local-stand.sh stop` as root to stop the three servers.
-
-```sh
-cargo run -- --config /tmp/hopmux-stand/config.toml status --routes --details
-cargo run -- --config /tmp/hopmux-stand/config.toml ssh target
-```
-
-The stand has been used to check three routes, multi-route upload and download, recursive transfers with an empty directory and symlink, resume after forced process termination, failover after an entrance stops, normal shell exit, manual and automatic terminal reconnection, cancellation of interrupted transfers, and a write failure that left the destination unpublished. Separate physical networks and modem failures remain untested.
+On Ubuntu WSL, run `tests/local-stand.sh` as root with the ordinary Linux username as its argument. The script starts three loopback SSH servers on ports 37221–37223 and writes `/tmp/hopmux-stand/config.toml`. Run `tests/local-stand.sh stop` to stop them.

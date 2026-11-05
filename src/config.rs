@@ -17,6 +17,8 @@ pub struct Config {
     pub nodes: BTreeMap<String, Node>,
     #[serde(default)]
     pub routes: Vec<Route>,
+    #[serde(skip)]
+    pub route_filter: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -283,7 +285,8 @@ impl Config {
     pub fn routes_for(&self, target: &str) -> Vec<Route> {
         self.effective_routes()
             .into_iter()
-            .filter(|r| !r.disabled && r.target == target)
+            .filter(|r| !r.disabled && r.target == target &&
+                (self.route_filter.is_empty() || self.route_filter.contains(&r.name)))
             .collect()
     }
 }

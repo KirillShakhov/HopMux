@@ -6,7 +6,6 @@
 [settings]
 connect_timeout_secs = 10
 check_interval_secs = 30
-max_parallel_routes = 3
 chunk_size = 1048576
 
 [nodes.edge_a]

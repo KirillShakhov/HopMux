@@ -3,18 +3,18 @@ use crate::{
     transport,
 };
 use anyhow::{Context, Result, ensure};
-use russh_sftp::{client::SftpSession, protocol::OpenFlags};
+use russh_sftp::{client::SftpSession, protocol::{FileAttributes, OpenFlags}};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, VecDeque},
-    fs,
     io::SeekFrom,
-    path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    path::Path,
+    fs,
+    sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::{io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, sync::Mutex};
 use uuid::Uuid;
 
 const MAX_ROUTE_ATTEMPTS: u32 = 3;
@@ -36,25 +36,9 @@ pub struct Journal {
     #[serde(default)]
     pub route_stats: BTreeMap<String, RouteTransferStats>,
     #[serde(default)]
-    pub owner_pid: u32,
-}
-
-pub fn is_active(journal: &Journal) -> bool {
-    if journal.published || journal.owner_pid == 0 {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        let Ok(pid) = i32::try_from(journal.owner_pid) else {
-            return false;
-        };
-        let result = unsafe { libc::kill(pid, 0) };
-        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-    }
-    #[cfg(not(unix))]
-    {
-        false
-    }
+    pub last_error: Option<String>,
+    #[serde(default)]
+    pub state_dir: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -74,36 +58,39 @@ fn now_unix_ms() -> u128 {
         .as_millis()
 }
 
-fn note_session(shared: &Arc<Mutex<Journal>>, route: &str) -> Result<()> {
-    let mut journal = shared.lock().unwrap();
+async fn note_session(shared: &Arc<Mutex<Journal>>, route: &str, sftp: &SftpSession) -> Result<()> {
+    let mut journal = shared.lock().await;
     let stats = journal.route_stats.entry(route.to_owned()).or_default();
     if stats.sessions > 0 {
         stats.reconnects = stats.reconnects.saturating_add(1);
     }
     stats.sessions = stats.sessions.saturating_add(1);
-    save(&journal)
+    save(sftp, &journal).await
 }
 
-fn note_error(shared: &Arc<Mutex<Journal>>, route: &str) -> Result<()> {
-    let mut journal = shared.lock().unwrap();
+async fn note_error(shared: &Arc<Mutex<Journal>>, route: &str, error: &anyhow::Error, sftp: &SftpSession) -> Result<()> {
+    let mut journal = shared.lock().await;
     let stats = journal.route_stats.entry(route.to_owned()).or_default();
     stats.errors = stats.errors.saturating_add(1);
-    save(&journal)
+    journal.last_error = Some(format!("{error:#}"));
+    save(sftp, &journal).await
 }
 
 fn retry_route(error: &anyhow::Error, attempts: u32) -> bool {
     !transport::is_permanent(error) && attempts < MAX_ROUTE_ATTEMPTS
 }
 
-fn note_chunk(
+async fn note_chunk(
     shared: &Arc<Mutex<Journal>>,
+    sftp: &SftpSession,
     route: &str,
     index: usize,
     bytes: usize,
     elapsed: Duration,
 ) -> Result<()> {
-    let mut journal = shared.lock().unwrap();
+    let mut journal = shared.lock().await;
     journal.complete[index] = true;
+    journal.last_error = None;
     let stats = journal.route_stats.entry(route.to_owned()).or_default();
     stats.bytes = stats.bytes.saturating_add(bytes as u64);
     let sample_bps = bytes as f64 / elapsed.as_secs_f64().max(0.001);
@@ -113,7 +100,7 @@ fn note_chunk(
             .map_or(sample_bps, |old| old * 0.7 + sample_bps * 0.3),
     );
     stats.last_at_unix_ms = now_unix_ms();
-    save(&journal)?;
+    save(sftp, &journal).await?;
     eprintln!(
         "{}: {}/{} chunks via {}",
         journal.id,
@@ -130,95 +117,92 @@ pub enum Direction {
     Get,
 }
 
-fn state_dir() -> Result<PathBuf> {
-    Ok(dirs::state_dir()
-        .or_else(|| dirs::home_dir().map(|p| p.join(".local/state")))
-        .context("cannot find state directory")?
-        .join("mssh/transfers"))
+async fn state_dir(sftp: &SftpSession) -> Result<String> {
+    let home = sftp.canonicalize(".").await?;
+    let root = format!("{home}/.mssh");
+    let dir = format!("{root}/transfers");
+    if !sftp.try_exists(&root).await? {
+        sftp.create_dir(&root).await?;
+    }
+    sftp.set_metadata(&root, FileAttributes { permissions: Some(0o700), ..Default::default() }).await?;
+    if !sftp.try_exists(&dir).await? {
+        sftp.create_dir(&dir).await?;
+    }
+    sftp.set_metadata(&dir, FileAttributes { permissions: Some(0o700), ..Default::default() }).await?;
+    Ok(dir)
 }
 
-fn journal_path(id: Uuid) -> Result<PathBuf> {
-    Ok(state_dir()?.join(format!("{id}.json")))
-}
-
-fn save(journal: &Journal) -> Result<()> {
-    let directory = state_dir()?;
-    fs::create_dir_all(&directory)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+async fn save(sftp: &SftpSession, journal: &Journal) -> Result<()> {
+    let path = format!("{}/{}.part.json", journal.state_dir, journal.id);
+    let backup = format!("{path}.bak");
+    let temporary = format!("{path}.new-{}", Uuid::new_v4());
+    let bytes = serde_json::to_vec(journal)?;
+    let mut file = sftp.open_with_flags_and_attributes(
+        &temporary,
+        OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+        FileAttributes { permissions: Some(0o600), ..Default::default() },
+    ).await?;
+    file.write_all(&bytes).await?;
+    file.close().await?;
+    if sftp.try_exists(&backup).await? {
+        if sftp.try_exists(&path).await? { sftp.remove_file(&backup).await?; }
+        else { sftp.rename(&backup, &path).await?; }
     }
-    let path = journal_path(journal.id)?;
-    let temporary = path.with_extension(format!("json.tmp-{}", Uuid::new_v4()));
-    let bytes = serde_json::to_vec_pretty(journal)?;
-    let mut options = fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+    let had_previous = sftp.try_exists(&path).await?;
+    if had_previous { sftp.rename(&path, &backup).await?; }
+    if let Err(error) = sftp.rename(&temporary, &path).await {
+        if had_previous { let _ = sftp.rename(&backup, &path).await; }
+        return Err(error.into());
     }
-    use std::io::Write;
-    let mut file = options.open(&temporary)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    fs::rename(temporary, path)?;
+    if had_previous { let _ = sftp.remove_file(&backup).await; }
     Ok(())
 }
 
-pub fn load(id: Uuid) -> Result<Journal> {
-    let path = journal_path(id)?;
-    Ok(serde_json::from_slice(
-        &fs::read(&path).with_context(|| format!("cannot load transfer {id}"))?,
-    )?)
-}
-
-pub fn list() -> Result<Vec<Journal>> {
-    let directory = state_dir()?;
-    if !directory.exists() {
-        return Ok(Vec::new());
-    }
-    let mut journals = Vec::new();
-    for entry in fs::read_dir(directory)? {
-        let path = entry?.path();
-        if path.extension().is_some_and(|ext| ext == "json")
-            && let Ok(journal) = serde_json::from_slice(&fs::read(path)?)
-        {
-            journals.push(journal);
+async fn remove_stale_journal_writes(sftp: &SftpSession, journal: &Journal) -> Result<()> {
+    let prefix = format!("{}.part.json.new-", journal.id);
+    for entry in sftp.read_dir(&journal.state_dir).await? {
+        let name = entry.file_name();
+        if name.starts_with(&prefix) {
+            sftp.remove_file(format!("{}/{name}", journal.state_dir)).await?;
         }
     }
-    journals.sort_by_key(|j: &Journal| j.id);
-    Ok(journals)
+    Ok(())
 }
 
-pub async fn cancel(config: &Config, id: Uuid) -> Result<()> {
-    let journal = load(id)?;
-    ensure!(!journal.published, "cannot cancel a published transfer");
-    ensure!(!is_active(&journal), "transfer is still active");
-    match journal.direction {
-        Direction::Put => {
-            let connection = connect_any(config, &journal.target).await?;
-            let sftp = sftp(&connection).await?;
-            ensure!(
-                !sftp.try_exists(&journal.destination).await?,
-                "destination already exists; inspect it before cancellation"
-            );
-            if sftp.try_exists(&journal.temporary).await? {
-                sftp.remove_file(&journal.temporary).await?;
-            }
+pub async fn list(config: &Config, target: &str) -> Result<Vec<Journal>> {
+    let connection = connect_any(config, target).await?;
+    let sftp = sftp(&connection).await?;
+    let dir = state_dir(&sftp).await?;
+    let mut journals = BTreeMap::<Uuid, Journal>::new();
+    for entry in sftp.read_dir(&dir).await? {
+        let name = entry.file_name();
+        if !name.ends_with(".part.json") && !name.ends_with(".part.json.bak") {
+            continue;
         }
-        Direction::Get => {
-            ensure!(
-                !Path::new(&journal.destination).exists(),
-                "destination already exists; inspect it before cancellation"
-            );
-            if Path::new(&journal.temporary).exists() {
-                fs::remove_file(&journal.temporary)?;
+        let bytes = sftp.read(format!("{dir}/{name}")).await?;
+        if let Ok(journal) = serde_json::from_slice::<Journal>(&bytes) {
+            if journal.target == target && (!journals.contains_key(&journal.id) || name.ends_with(".part.json")) {
+                journals.insert(journal.id, journal);
             }
         }
     }
-    fs::remove_file(journal_path(id)?)?;
+    Ok(journals.into_values().collect())
+}
+
+pub async fn discard(config: &Config, journal: &Journal) -> Result<()> {
+    let connection = connect_any(config, &journal.target).await?;
+    let sftp = sftp(&connection).await?;
+    if matches!(journal.direction, Direction::Put) && sftp.try_exists(&journal.temporary).await? {
+        sftp.remove_file(&journal.temporary).await?;
+    }
+    if matches!(journal.direction, Direction::Get) && Path::new(&journal.temporary).exists() {
+        std::fs::remove_file(&journal.temporary)?;
+    }
+    let path = format!("{}/{}.part.json", journal.state_dir, journal.id);
+    if sftp.try_exists(&path).await? { sftp.remove_file(&path).await?; }
+    let backup = format!("{path}.bak");
+    if sftp.try_exists(&backup).await? { sftp.remove_file(&backup).await?; }
+    remove_stale_journal_writes(&sftp, journal).await?;
     Ok(())
 }
 
@@ -280,6 +264,8 @@ pub async fn put(config: &Config, target: &str, source: &Path, destination: &str
     let id = Uuid::new_v4();
     let temporary = format!("{destination}.mssh-{id}.part");
     let chunks = size.div_ceil(config.settings.chunk_size as u64) as usize;
+    let connection = connect_any(config, target).await?;
+    let sftp = sftp(&connection).await?;
     let mut journal = Journal {
         id,
         direction: Direction::Put,
@@ -294,10 +280,9 @@ pub async fn put(config: &Config, target: &str, source: &Path, destination: &str
         complete: vec![false; chunks],
         published: false,
         route_stats: BTreeMap::new(),
-        owner_pid: std::process::id(),
+        last_error: None,
+        state_dir: state_dir(&sftp).await?,
     };
-    let connection = connect_any(config, target).await?;
-    let sftp = sftp(&connection).await?;
     ensure!(
         !sftp.try_exists(destination).await?,
         "destination already exists"
@@ -309,7 +294,10 @@ pub async fn put(config: &Config, target: &str, source: &Path, destination: &str
         )
         .await?;
     file.close().await?;
-    save(&journal)?;
+    if let Err(error) = save(&sftp, &journal).await {
+        let _ = sftp.remove_file(&journal.temporary).await;
+        return Err(error);
+    }
     process_put(config, &mut journal).await?;
     Ok(id)
 }
@@ -327,13 +315,15 @@ async fn process_put(config: &Config, journal: &mut Journal) -> Result<()> {
         .take(config.settings.max_parallel_routes)
         .collect();
     ensure!(!routes.is_empty(), "no route to target {}", journal.target);
+    let control_connection = connect_any(config, &journal.target).await?;
+    let control_sftp = sftp(&control_connection).await?;
     let shared = Arc::new(Mutex::new(journal.clone()));
     let config = Arc::new(config.clone());
     let mut failures = BTreeMap::<String, u32>::new();
     loop {
         let pending: Vec<usize> = shared
             .lock()
-            .unwrap()
+            .await
             .complete
             .iter()
             .enumerate()
@@ -362,7 +352,7 @@ async fn process_put(config: &Config, journal: &mut Journal) -> Result<()> {
             let (name, outcome) = result?;
             if let Err(error) = outcome {
                 eprintln!("route {name}: {error:#}");
-                note_error(&shared, &name)?;
+                note_error(&shared, &name, &error, &control_sftp).await?;
                 let attempts = failures.entry(name.clone()).or_default();
                 *attempts += 1;
                 if !retry_route(&error, *attempts) {
@@ -371,12 +361,12 @@ async fn process_put(config: &Config, journal: &mut Journal) -> Result<()> {
             }
         }
         routes.retain(|r| !failed.contains(&r.name));
-        if !routes.is_empty() && shared.lock().unwrap().complete.iter().any(|&done| !done) {
+        if !routes.is_empty() && shared.lock().await.complete.iter().any(|&done| !done) {
             let attempts = failures.values().copied().max().unwrap_or(0);
             tokio::time::sleep(Duration::from_secs(u64::from(attempts.min(2)))).await;
         }
     }
-    *journal = shared.lock().unwrap().clone();
+    *journal = shared.lock().await.clone();
     let connection = connect_any(&config, &journal.target).await?;
     let sftp = sftp(&connection).await?;
     let mut remote = sftp.open(&journal.temporary).await?;
@@ -407,7 +397,7 @@ async fn process_put(config: &Config, journal: &mut Journal) -> Result<()> {
         journal.temporary
     );
     journal.published = true;
-    save(journal)?;
+    save(&sftp, journal).await?;
     // The published name is safe now; cleanup failure is nonfatal.
     let _ = sftp.remove_file(&journal.temporary).await;
     Ok(())
@@ -421,11 +411,11 @@ async fn put_worker(
 ) -> Result<()> {
     let connection = transport::connect(&config, &route).await?;
     let sftp = sftp(&connection).await?;
-    note_session(&shared, &route.name)?;
-    let snapshot = shared.lock().unwrap().clone();
+    note_session(&shared, &route.name, &sftp).await?;
+    let snapshot = shared.lock().await.clone();
     let mut local = tokio::fs::File::open(&snapshot.source).await?;
     loop {
-        let Some(index) = queue.lock().unwrap().pop_front() else {
+        let Some(index) = queue.lock().await.pop_front() else {
             break;
         };
         let chunk_started = Instant::now();
@@ -449,19 +439,20 @@ async fn put_worker(
             Sha256::digest(&buffer) == Sha256::digest(&readback),
             "remote chunk {index} differs after write"
         );
-        note_chunk(&shared, &route.name, index, length, chunk_started.elapsed())?;
+        note_chunk(&shared, &sftp, &route.name, index, length, chunk_started.elapsed()).await?;
     }
     Ok(())
 }
 
-pub async fn resume(config: &Config, id: Uuid) -> Result<()> {
-    let mut journal = load(id)?;
+pub async fn continue_transfer(config: &Config, journal: &Journal) -> Result<()> {
+    let mut journal = journal.clone();
     ensure!(!journal.published, "transfer already published");
-    ensure!(!is_active(&journal), "transfer is still active");
-    journal.owner_pid = std::process::id();
     // Completed chunks have been written (and uploads read back) before being
     // recorded. Keep them on resume; the full-file digest checks the result.
-    save(&journal)?;
+    let connection = connect_any(config, &journal.target).await?;
+    let sftp = sftp(&connection).await?;
+    remove_stale_journal_writes(&sftp, &journal).await?;
+    save(&sftp, &journal).await?;
     match journal.direction {
         Direction::Put => process_put(config, &mut journal).await,
         Direction::Get => process_get(config, &mut journal).await,
@@ -524,9 +515,13 @@ pub async fn get(config: &Config, target: &str, source: &str, destination: &Path
         complete: vec![false; size.div_ceil(config.settings.chunk_size as u64) as usize],
         published: false,
         route_stats: BTreeMap::new(),
-        owner_pid: std::process::id(),
+        last_error: None,
+        state_dir: state_dir(&sftp).await?,
     };
-    save(&journal)?;
+    if let Err(error) = save(&sftp, &journal).await {
+        let _ = fs::remove_file(&journal.temporary);
+        return Err(error);
+    }
     process_get(config, &mut journal).await?;
     Ok(id)
 }
@@ -546,13 +541,15 @@ async fn process_get(config: &Config, journal: &mut Journal) -> Result<()> {
         Path::new(&journal.temporary).exists(),
         "local temporary file is missing"
     );
+    let control_connection = connect_any(config, &journal.target).await?;
+    let control_sftp = sftp(&control_connection).await?;
     let shared = Arc::new(Mutex::new(journal.clone()));
     let config = Arc::new(config.clone());
     let mut failures = BTreeMap::<String, u32>::new();
     loop {
         let pending: Vec<usize> = shared
             .lock()
-            .unwrap()
+            .await
             .complete
             .iter()
             .enumerate()
@@ -581,7 +578,7 @@ async fn process_get(config: &Config, journal: &mut Journal) -> Result<()> {
             let (name, outcome) = result?;
             if let Err(error) = outcome {
                 eprintln!("route {name}: {error:#}");
-                note_error(&shared, &name)?;
+                note_error(&shared, &name, &error, &control_sftp).await?;
                 let attempts = failures.entry(name.clone()).or_default();
                 *attempts += 1;
                 if !retry_route(&error, *attempts) {
@@ -590,12 +587,12 @@ async fn process_get(config: &Config, journal: &mut Journal) -> Result<()> {
             }
         }
         routes.retain(|r| !failed.contains(&r.name));
-        if !routes.is_empty() && shared.lock().unwrap().complete.iter().any(|&done| !done) {
+        if !routes.is_empty() && shared.lock().await.complete.iter().any(|&done| !done) {
             let attempts = failures.values().copied().max().unwrap_or(0);
             tokio::time::sleep(Duration::from_secs(u64::from(attempts.min(2)))).await;
         }
     }
-    *journal = shared.lock().unwrap().clone();
+    *journal = shared.lock().await.clone();
     let (size, sha256, _) = local_hash(Path::new(&journal.temporary)).await?;
     ensure!(
         size == journal.size && sha256 == journal.sha256,
@@ -605,7 +602,7 @@ async fn process_get(config: &Config, journal: &mut Journal) -> Result<()> {
     fs::hard_link(&journal.temporary, destination)
         .context("cannot publish without overwriting destination")?;
     journal.published = true;
-    save(journal)?;
+    save(&control_sftp, journal).await?;
     let _ = fs::remove_file(&journal.temporary);
     Ok(())
 }
@@ -618,8 +615,8 @@ async fn get_worker(
 ) -> Result<()> {
     let connection = transport::connect(&config, &route).await?;
     let sftp = sftp(&connection).await?;
-    note_session(&shared, &route.name)?;
-    let snapshot = shared.lock().unwrap().clone();
+    note_session(&shared, &route.name, &sftp).await?;
+    let snapshot = shared.lock().await.clone();
     let metadata = sftp.metadata(&snapshot.source).await?;
     let mtime = metadata
         .modified()
@@ -636,7 +633,7 @@ async fn get_worker(
         .open(&snapshot.temporary)
         .await?;
     loop {
-        let Some(index) = queue.lock().unwrap().pop_front() else {
+        let Some(index) = queue.lock().await.pop_front() else {
             break;
         };
         let chunk_started = Instant::now();
@@ -648,7 +645,7 @@ async fn get_worker(
         local.seek(SeekFrom::Start(offset)).await?;
         local.write_all(&buffer).await?;
         local.sync_data().await?;
-        note_chunk(&shared, &route.name, index, length, chunk_started.elapsed())?;
+        note_chunk(&shared, &sftp, &route.name, index, length, chunk_started.elapsed()).await?;
     }
     remote.close().await?;
     Ok(())
