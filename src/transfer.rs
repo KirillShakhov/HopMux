@@ -39,6 +39,49 @@ pub struct Journal {
     pub last_error: Option<String>,
     #[serde(default)]
     pub state_dir: String,
+    #[serde(default)]
+    pub worker_host: String,
+    #[serde(default)]
+    pub worker_pid: u32,
+    #[serde(default)]
+    pub updated_at_unix_ms: u128,
+}
+
+fn worker_host() -> String {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            std::process::Command::new("hostname")
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        })
+        .unwrap_or_default()
+}
+
+pub fn is_active(journal: &Journal) -> bool {
+    if journal.published || journal.worker_pid == 0 {
+        return false;
+    }
+    let same_host = !journal.worker_host.is_empty() && journal.worker_host == worker_host();
+    #[cfg(unix)]
+    if same_host {
+        let Ok(pid) = i32::try_from(journal.worker_pid) else { return false };
+        #[cfg(target_os = "linux")]
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            if stat.rsplit_once(") ").is_some_and(|(_, rest)| rest.starts_with('Z') || rest.starts_with('X')) {
+                return false;
+            }
+        }
+        let result = unsafe { libc::kill(pid, 0) };
+        return result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
+    }
+    #[cfg(not(unix))]
+    let _ = same_host;
+    now_unix_ms().saturating_sub(journal.updated_at_unix_ms) < 30_000
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -60,6 +103,7 @@ fn now_unix_ms() -> u128 {
 
 async fn note_session(shared: &Arc<Mutex<Journal>>, route: &str, sftp: &SftpSession) -> Result<()> {
     let mut journal = shared.lock().await;
+    journal.updated_at_unix_ms = now_unix_ms();
     let stats = journal.route_stats.entry(route.to_owned()).or_default();
     if stats.sessions > 0 {
         stats.reconnects = stats.reconnects.saturating_add(1);
@@ -70,6 +114,7 @@ async fn note_session(shared: &Arc<Mutex<Journal>>, route: &str, sftp: &SftpSess
 
 async fn note_error(shared: &Arc<Mutex<Journal>>, route: &str, error: &anyhow::Error, sftp: &SftpSession) -> Result<()> {
     let mut journal = shared.lock().await;
+    journal.updated_at_unix_ms = now_unix_ms();
     let stats = journal.route_stats.entry(route.to_owned()).or_default();
     stats.errors = stats.errors.saturating_add(1);
     journal.last_error = Some(format!("{error:#}"));
@@ -90,6 +135,7 @@ async fn note_chunk(
 ) -> Result<()> {
     let mut journal = shared.lock().await;
     journal.complete[index] = true;
+    journal.updated_at_unix_ms = now_unix_ms();
     journal.last_error = None;
     let stats = journal.route_stats.entry(route.to_owned()).or_default();
     stats.bytes = stats.bytes.saturating_add(bytes as u64);
@@ -190,6 +236,7 @@ pub async fn list(config: &Config, target: &str) -> Result<Vec<Journal>> {
 }
 
 pub async fn discard(config: &Config, journal: &Journal) -> Result<()> {
+    ensure!(!is_active(journal), "transfer is still active");
     let connection = connect_any(config, &journal.target).await?;
     let sftp = sftp(&connection).await?;
     if matches!(journal.direction, Direction::Put) && sftp.try_exists(&journal.temporary).await? {
@@ -282,6 +329,9 @@ pub async fn put(config: &Config, target: &str, source: &Path, destination: &str
         route_stats: BTreeMap::new(),
         last_error: None,
         state_dir: state_dir(&sftp).await?,
+        worker_host: worker_host(),
+        worker_pid: std::process::id(),
+        updated_at_unix_ms: now_unix_ms(),
     };
     ensure!(
         !sftp.try_exists(destination).await?,
@@ -447,6 +497,10 @@ async fn put_worker(
 pub async fn continue_transfer(config: &Config, journal: &Journal) -> Result<()> {
     let mut journal = journal.clone();
     ensure!(!journal.published, "transfer already published");
+    ensure!(!is_active(&journal), "transfer is still active");
+    journal.worker_host = worker_host();
+    journal.worker_pid = std::process::id();
+    journal.updated_at_unix_ms = now_unix_ms();
     // Completed chunks have been written (and uploads read back) before being
     // recorded. Keep them on resume; the full-file digest checks the result.
     let connection = connect_any(config, &journal.target).await?;
@@ -517,6 +571,9 @@ pub async fn get(config: &Config, target: &str, source: &str, destination: &Path
         route_stats: BTreeMap::new(),
         last_error: None,
         state_dir: state_dir(&sftp).await?,
+        worker_host: worker_host(),
+        worker_pid: std::process::id(),
+        updated_at_unix_ms: now_unix_ms(),
     };
     if let Err(error) = save(&sftp, &journal).await {
         let _ = fs::remove_file(&journal.temporary);
@@ -654,6 +711,24 @@ async fn get_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn active_transfer_is_not_offered_for_a_second_worker() {
+        let mut journal: Journal = serde_json::from_value(serde_json::json!({
+            "id": Uuid::new_v4(), "direction": "Put", "target": "edge_a",
+            "source": "/tmp/source", "destination": "/tmp/destination",
+            "temporary": "/tmp/destination.part", "size": 1,
+            "source_mtime": null, "sha256": "", "chunk_size": 65536,
+            "complete": [false], "published": false
+        })).unwrap();
+        journal.worker_host = worker_host();
+        journal.worker_pid = std::process::id();
+        journal.updated_at_unix_ms = now_unix_ms();
+        assert!(is_active(&journal));
+        journal.worker_pid = u32::MAX;
+        assert!(!is_active(&journal));
+    }
 
     #[test]
     fn transient_failures_get_bounded_retries() {

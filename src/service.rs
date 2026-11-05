@@ -281,6 +281,9 @@ pub async fn prepare_copy(config: &Config, source: &str, destination: &str, recu
             CopySource::Remote(p) => matches!(j.direction, transfer::Direction::Get) && j.source.as_str() == p.as_str(),
         }
     });
+    if let Some(journal) = &partial {
+        ensure!(!transfer::is_active(journal), "transfer is still active; inspect it with mssh transfers {target}");
+    }
     Ok(CopyPlan { target, source, destination, partial, recursive })
 }
 
