@@ -26,10 +26,12 @@ impl client::Handler for HostKeyPin {
         key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
         // Certificate trust requires CA and principal validation; pins apply only to raw keys.
-        Ok(key.certificate().is_none()
+        let accepted = key.certificate().is_none()
             && self.fingerprint.as_ref().is_none_or(|fingerprint| {
                 key.public_key().fingerprint(Default::default()).to_string() == *fingerprint
-            }))
+            });
+        crate::debug_log!("SSH host key: {} ({})", if accepted { "accepted" } else { "rejected" }, if self.fingerprint.is_some() { "pinned" } else { "unpinned" });
+        Ok(accepted)
     }
 }
 
@@ -87,6 +89,7 @@ pub fn failure_state(error: &anyhow::Error) -> &'static str {
 async fn authenticate(handle: &mut client::Handle<HostKeyPin>, node: &Node) -> Result<()> {
     let mut method_errors = Vec::new();
     if let Some(path) = &node.key_file {
+        crate::debug_log!("auth {}: trying key", node.host);
         let attempt: Result<bool> = async {
             let expanded = if let Some(rest) = path.strip_prefix("~/") {
                 dirs::home_dir()
@@ -111,16 +114,17 @@ async fn authenticate(handle: &mut client::Handle<HostKeyPin>, node: &Node) -> R
         }
         .await;
         match attempt {
-            Ok(true) => return Ok(()),
-            Ok(false) => method_errors.push("key rejected".to_owned()),
-            Err(error) => method_errors.push(format!("key unavailable: {error:#}")),
+            Ok(true) => { crate::debug_log!("auth {}: key accepted", node.host); return Ok(()) },
+            Ok(false) => { crate::debug_log!("auth {}: key rejected", node.host); method_errors.push("key rejected".to_owned()) },
+            Err(error) => { crate::debug_log!("auth {}: key unavailable: {error:#}", node.host); method_errors.push(format!("key unavailable: {error:#}")) },
         }
     }
     if node.agent {
+        crate::debug_log!("auth {}: trying SSH agent", node.host);
         match authenticate_agent(handle, node).await {
-            Ok(true) => return Ok(()),
-            Ok(false) => method_errors.push("agent identities rejected".to_owned()),
-            Err(error) => method_errors.push(format!("agent unavailable: {error:#}")),
+            Ok(true) => { crate::debug_log!("auth {}: SSH agent accepted", node.host); return Ok(()) },
+            Ok(false) => { crate::debug_log!("auth {}: SSH agent identities rejected", node.host); method_errors.push("agent identities rejected".to_owned()) },
+            Err(error) => { crate::debug_log!("auth {}: SSH agent unavailable: {error:#}", node.host); method_errors.push(format!("agent unavailable: {error:#}")) },
         }
     }
     let password = if let Some(inline) = &node.password {
@@ -137,13 +141,16 @@ async fn authenticate(handle: &mut client::Handle<HostKeyPin>, node: &Node) -> R
         None
     };
     if let Some(password) = password {
+        crate::debug_log!("auth {}: trying password", node.host);
         if handle
             .authenticate_password(&node.user, password)
             .await?
             .success()
         {
+            crate::debug_log!("auth {}: password accepted", node.host);
             return Ok(());
         }
+        crate::debug_log!("auth {}: password rejected", node.host);
         method_errors.push("password rejected".to_owned());
     }
     Err(anyhow::Error::new(AuthenticationFailure {
@@ -185,6 +192,7 @@ async fn authenticate_agent(_: &mut client::Handle<HostKeyPin>, _: &Node) -> Res
 }
 
 pub async fn connect(config: &Config, route: &Route) -> Result<Connection> {
+    crate::debug_log!("route {}: connecting to {} via {}", route.name, route.target, route.hops.join(" -> "));
     let started = Instant::now();
     let duration = Duration::from_secs(config.settings.connect_timeout_secs);
     let ssh_config = Arc::new(client::Config {
@@ -198,6 +206,7 @@ pub async fn connect(config: &Config, route: &Route) -> Result<Connection> {
         let hop_started = Instant::now();
         let node = &config.nodes[hop];
         let host = route.addresses.get(hop).unwrap_or(&node.host);
+        crate::debug_log!("route {}: hop {} connecting to {}:{} ({})", route.name, hop, host, node.port, if handles.is_empty() { "direct" } else { "forwarded" });
         let pin = HostKeyPin {
             fingerprint: node.host_key.clone(),
         };
@@ -241,6 +250,7 @@ pub async fn connect(config: &Config, route: &Route) -> Result<Connection> {
                 format!("SSH handshake failed at node {hop} on route {}", route.name)
             })?
         };
+        crate::debug_log!("route {}: hop {} SSH handshake complete", route.name, hop);
         timeout(duration, authenticate(&mut handle, node))
             .await
             .with_context(|| {
@@ -248,11 +258,13 @@ pub async fn connect(config: &Config, route: &Route) -> Result<Connection> {
             })?
             .with_context(|| format!("at node {hop} on route {}", route.name))?;
         handles.push(handle);
+        crate::debug_log!("route {}: hop {} authenticated in {} ms", route.name, hop, hop_started.elapsed().as_millis());
         hop_timings.push(HopTiming {
             node: hop.clone(),
             connect_ms: hop_started.elapsed().as_millis(),
         });
     }
+    crate::debug_log!("route {}: connected in {} ms", route.name, started.elapsed().as_millis());
     Ok(Connection {
         handles,
         elapsed: started.elapsed(),

@@ -57,12 +57,14 @@ pub async fn probe_routes(config: &Config, target: Option<&str>) -> Vec<RouteSta
     let shared = Arc::new(config.clone());
     let semaphore = Arc::new(Semaphore::new(config.settings.max_parallel_routes));
     let mut tasks = Vec::new();
+    crate::debug_log!("status: probing {} enabled routes", routes.len());
     for route in routes {
         let shared = shared.clone();
         let semaphore = semaphore.clone();
         tasks.push(tokio::spawn(async move {
             let _permit = semaphore.acquire().await.expect("semaphore closed");
             let result = transport::connect(&shared, &route).await;
+            crate::debug_log!("status: route {} probe {}", route.name, if result.is_ok() { "connected" } else { "failed" });
             let checked_at_unix_ms = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -88,6 +90,7 @@ pub async fn probe_routes(config: &Config, target: Option<&str>) -> Vec<RouteSta
                             Some("SSH ping timed out".to_owned()),
                         ),
                     };
+                    crate::debug_log!("status: route {} state {}, RTT {:?} ms", route.name, state, rtt_ms);
                     RouteStatus {
                         route: route.name,
                         target: route.target,
@@ -101,7 +104,9 @@ pub async fn probe_routes(config: &Config, target: Option<&str>) -> Vec<RouteSta
 
                     }
                 }
-                Err(error) => RouteStatus {
+                Err(error) => {
+                    crate::debug_log!("status: route {} failed: {error:#}", route.name);
+                    RouteStatus {
                     route: route.name,
                     target: route.target,
                     state: transport::failure_state(&error).into(),
@@ -112,6 +117,7 @@ pub async fn probe_routes(config: &Config, target: Option<&str>) -> Vec<RouteSta
                     hops: route.hops,
                     hop_timings: Vec::new(),
 
+                    }
                 },
             }
         }));
@@ -133,17 +139,19 @@ pub async fn ssh(config: &Config, target: &str) -> Result<()> {
     let mut index = 0;
     loop {
         let route = routes[index % routes.len()].clone();
+        crate::debug_log!("SSH shell: trying route {} (attempt {})", route.name, index + 1);
         index += 1;
         match transport::connect(config, &route).await {
             Ok(connection) => {
                 eprintln!("connected via {} (Ctrl-] to reconnect)", route.name);
                 match shell(&connection).await {
-                    Ok(true) => return Ok(()),
-                    Ok(false) => eprintln!("reconnecting..."),
-                    Err(error) => eprintln!("shell disconnected: {error:#}; reconnecting..."),
+                    Ok(true) => { crate::debug_log!("SSH shell: remote session ended normally"); return Ok(()) },
+                    Ok(false) => { crate::debug_log!("SSH shell: reconnect requested"); eprintln!("reconnecting...") },
+                    Err(error) => { crate::debug_log!("SSH shell: disconnected: {error:#}"); eprintln!("shell disconnected: {error:#}; reconnecting...") },
                 }
             }
             Err(error) => {
+                crate::debug_log!("SSH shell: route {} failed: {error:#}", route.name);
                 eprintln!("route {} failed: {error:#}", route.name);
                 if transport::is_permanent(&error) {
                     routes.retain(|candidate| candidate.name != route.name);
@@ -160,6 +168,7 @@ pub async fn ssh(config: &Config, target: &str) -> Result<()> {
 }
 
 async fn shell(connection: &transport::Connection) -> Result<bool> {
+    crate::debug_log!("SSH shell: opening session channel");
     let channel = connection.final_handle().channel_open_session().await?;
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
     let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
@@ -167,6 +176,7 @@ async fn shell(connection: &transport::Connection) -> Result<bool> {
         .request_pty(true, &term, cols as u32, rows as u32, 0, 0, &[])
         .await?;
     channel.request_shell(true).await?;
+    crate::debug_log!("SSH shell: PTY requested, terminal {}x{}", cols, rows);
     crossterm::terminal::enable_raw_mode().context("cannot enable raw terminal")?;
     let result = shell_io(channel, (cols, rows)).await;
     crossterm::terminal::disable_raw_mode()?;
@@ -253,6 +263,7 @@ fn remote_spec<'a>(config: &Config, arg: &'a str) -> Result<Option<(&'a str, &'a
 pub async fn prepare_copy(config: &Config, source: &str, destination: &str, recursive: bool) -> Result<CopyPlan> {
     let from = remote_spec(config, source)?;
     let to = remote_spec(config, destination)?;
+    crate::debug_log!("copy: source remote={}, destination remote={}, recursive={recursive}", from.is_some(), to.is_some());
     let (target, source, destination) = match (from, to) {
         (Some((target, remote)), None) => {
             let name = Path::new(remote).file_name().and_then(|n| n.to_str()).context("invalid remote filename")?;
@@ -260,6 +271,7 @@ pub async fn prepare_copy(config: &Config, source: &str, destination: &str, recu
             let local = if local.is_dir() { local.join(name) } else { local.to_path_buf() };
             let parent = local.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
             let local = std::fs::canonicalize(parent)?.join(local.file_name().context("invalid destination")?);
+            crate::debug_log!("copy: download {}:{} -> {}", target, remote, local.display());
             (target.to_owned(), CopySource::Remote(remote.to_owned()), local.to_string_lossy().into_owned())
         }
         (None, Some((target, remote))) => {
@@ -270,11 +282,13 @@ pub async fn prepare_copy(config: &Config, source: &str, destination: &str, recu
             let remote = if sftp.try_exists(remote).await? && sftp.metadata(remote).await?.file_type().is_dir() {
                 format!("{}/{}", remote.trim_end_matches('/'), name)
             } else { remote.to_owned() };
+            crate::debug_log!("copy: upload {} -> {}:{}", local.display(), target, remote);
             (target.to_owned(), CopySource::Local(local), remote)
         }
         _ => bail!("specify one local and one TARGET:/absolute/path endpoint"),
     };
     let journals = transfer::list(config, &target).await?;
+    crate::debug_log!("copy: checked {} remote transfer journals", journals.len());
     let partial = journals.into_iter().find(|j| {
         !j.published && j.destination == destination && match &source {
             CopySource::Local(p) => matches!(j.direction, transfer::Direction::Put) && j.source.as_str() == p.to_string_lossy().as_ref(),
@@ -282,6 +296,7 @@ pub async fn prepare_copy(config: &Config, source: &str, destination: &str, recu
         }
     });
     if let Some(journal) = &partial {
+        crate::debug_log!("copy: matching partial transfer {} has {}/{} chunks", journal.id, journal.complete.iter().filter(|&&done| done).count(), journal.complete.len());
         ensure!(!transfer::is_active(journal), "transfer is still active; inspect it with mssh transfers {target}");
     }
     Ok(CopyPlan { target, source, destination, partial, recursive })
@@ -290,17 +305,19 @@ pub async fn prepare_copy(config: &Config, source: &str, destination: &str, recu
 pub async fn execute_copy(config: &Config, plan: CopyPlan, action: PartialAction) -> Result<()> {
     if let Some(journal) = &plan.partial {
         match action {
-            PartialAction::Continue => return transfer::continue_transfer(config, journal).await,
-            PartialAction::Restart => transfer::discard(config, journal).await?,
+            PartialAction::Continue => { crate::debug_log!("copy: continuing transfer {}", journal.id); return transfer::continue_transfer(config, journal).await },
+            PartialAction::Restart => { crate::debug_log!("copy: discarding partial transfer {}", journal.id); transfer::discard(config, journal).await? },
             PartialAction::New => bail!("partial transfer exists"),
         }
     }
     match plan.source {
         CopySource::Local(path) => {
             if path.is_dir() {
+                crate::debug_log!("copy: uploading directory {}", path.display());
                 ensure!(plan.recursive, "source is a directory; use -r");
                 directory::put_directory(config, &plan.target, &path, &plan.destination).await
             } else {
+                crate::debug_log!("copy: uploading file {}", path.display());
                 transfer::put(config, &plan.target, &path, &plan.destination).await?;
                 Ok(())
             }
@@ -309,9 +326,11 @@ pub async fn execute_copy(config: &Config, plan: CopyPlan, action: PartialAction
             let connection = transfer::connect_any(config, &plan.target).await?;
             let sftp = transfer::sftp(&connection).await?;
             if sftp.metadata(&path).await?.file_type().is_dir() {
+                crate::debug_log!("copy: downloading directory {path}");
                 ensure!(plan.recursive, "source is a directory; use -r");
                 directory::get_directory(config, &plan.target, &path, Path::new(&plan.destination)).await
             } else {
+                crate::debug_log!("copy: downloading file {path}");
                 transfer::get(config, &plan.target, &path, Path::new(&plan.destination)).await?;
                 Ok(())
             }
