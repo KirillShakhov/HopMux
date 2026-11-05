@@ -32,11 +32,17 @@ mssh transfers edge_a
 mssh status edge_a --details
 mssh --debug status edge_a
 mssh --debug edge_a:/home/niias/test.yml ./downloads/
+mssh --chunk-size auto --min-chunk-size 256KiB --max-chunk-size 8MiB edge_a:/data/big.bin ./downloads/
+mssh --route-chunk slow=512KiB --chunk-timeout 60 ./big.bin edge_a:/data/
 mssh status --json
 mssh config check
 ```
 
-Copying to an existing directory appends the source name, as with `scp`. Remote paths must be absolute. Use `-r` for directories. All available routes are used for file transfers by default; `--route NAME` selects a route and can be repeated. `--max-routes N` limits the number used concurrently, and `--chunk-size BYTES` sets the chunk size (64 KiB to 8 MiB).
+Copying to an existing directory appends the source name, as with `scp`. Remote paths must be absolute. Use `-r` for directories. All available routes are used for file transfers by default; `--route NAME` selects a route and can be repeated. `--max-routes N` limits the number used concurrently.
+
+File transfers adapt batch size separately for each route. The initial size is `settings.chunk_size` (1 MiB by default); after three verified batches at a size, the worker compares median throughput and may double it. It stops increasing when a larger size is slower, and shrinks after two consecutive failed batches. The first sample on a route includes SSH/SFTP connection time; each sample includes local I/O, remote readback for uploads, and remote journal persistence. A single failure does not shrink the batch. Short files may finish before there are enough samples to tune.
+
+`--chunk-size auto` selects adaptation explicitly; `--chunk-size SIZE` fixes the size. `--min-chunk-size SIZE` and `--max-chunk-size SIZE` set the auto range (defaults: 256 KiB and 8 MiB). Repeat `--route-chunk ROUTE=SIZE` to fix individual routes at different sizes. `--chunk-timeout SECONDS` limits the I/O for one batch (default: 120 seconds, allowed: 1–300). Sizes accept bytes, `KiB`, or `MiB`, must be multiples of 64 KiB, and may be 64 KiB–32 MiB. Total transfer buffers are limited to 256 MiB. Completed 256 KiB or smaller atoms remain in the remote journal, so changing batch sizes does not discard verified progress. Older journals retain their original fixed block size when resumed.
 
 `--debug` works with every command and writes timestamped operation logs to stderr, including route selection, SSH authentication method, SFTP activity, block offsets, verification, and remote journal updates. It does not print passwords or file contents. `--details` only adds information to the `status` report. With `-d --debug`, the worker keeps writing to the current terminal's stderr while that terminal remains open; no client log file is created.
 
@@ -44,7 +50,7 @@ An interrupted file copy leaves a partial file and a journal under `~/.mssh/tran
 
 Uploads verify each written chunk and the final SHA-256 before publishing. Downloads verify the final SHA-256. Publishing does not overwrite an existing destination. Recursive copies preserve regular files, empty directories, symbolic links, permissions, and modification times on Linux.
 
-`status` probes routes and displays connection times, SSH round-trip times, hop timings with `--details`, and transfer progress from remote journals. `config check` validates the configuration. `mssh TARGET` opens an SSH shell and reconnects after a transport failure; Ctrl-] forces a reconnect.
+`status` probes routes and displays connection times, SSH round-trip times, hop timings with `--details`, and transfer progress from remote journals. `status --details` and `transfers TARGET` show the current batch size and route timing. `config check` validates the configuration. `mssh TARGET` opens an SSH shell and reconnects after a transport failure; Ctrl-] forces a reconnect.
 
 ## Limits
 

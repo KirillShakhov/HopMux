@@ -19,7 +19,21 @@ pub struct Config {
     pub routes: Vec<Route>,
     #[serde(skip)]
     pub route_filter: Vec<String>,
+    #[serde(skip, default = "default_auto_chunk")]
+    pub auto_chunk: bool,
+    #[serde(skip, default = "default_min_chunk")]
+    pub min_chunk_size: usize,
+    #[serde(skip, default = "default_max_chunk")]
+    pub max_chunk_size: usize,
+    #[serde(skip)]
+    pub chunk_timeout_secs: Option<u64>,
+    #[serde(skip)]
+    pub route_chunk_sizes: BTreeMap<String, usize>,
 }
+
+fn default_auto_chunk() -> bool { true }
+fn default_min_chunk() -> usize { 256 * 1024 }
+fn default_max_chunk() -> usize { 8 * 1024 * 1024 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

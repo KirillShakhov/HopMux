@@ -20,6 +20,18 @@ use uuid::Uuid;
 const MAX_ROUTE_ATTEMPTS: u32 = 3;
 const ATOM_SIZE: usize = 256 * 1024;
 
+fn atom_size(config: &Config) -> usize {
+    fn gcd(mut a: usize, mut b: usize) -> usize {
+        while b != 0 { (a, b) = (b, a % b); }
+        a
+    }
+    let mut size = gcd(ATOM_SIZE, config.settings.chunk_size);
+    size = gcd(size, config.min_chunk_size);
+    size = gcd(size, config.max_chunk_size);
+    for &route_size in config.route_chunk_sizes.values() { size = gcd(size, route_size); }
+    size
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Journal {
     #[serde(default)]
@@ -36,6 +48,14 @@ pub struct Journal {
     pub chunk_size: usize,
     #[serde(default)]
     pub batch_size: usize,
+    #[serde(default)]
+    pub adaptive: bool,
+    #[serde(default)]
+    pub min_batch_size: usize,
+    #[serde(default)]
+    pub max_batch_size: usize,
+    #[serde(default)]
+    pub chunk_timeout_secs: Option<u64>,
     pub complete: Vec<bool>,
     pub published: bool,
     #[serde(default)]
@@ -103,6 +123,66 @@ pub struct RouteTransferStats {
     pub session_ms: u128,
     #[serde(default)]
     pub failed_session_ms: u128,
+    #[serde(default)]
+    pub chosen_batch_size: usize,
+    #[serde(default)]
+    pub fixed_batch_size: bool,
+    #[serde(default)]
+    pub observations: Vec<BatchObservation>,
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    #[serde(default)]
+    pub cooldown_batches: u32,
+    #[serde(default)]
+    pub pending_connect_ms: u128,
+    #[serde(default)]
+    pub adaptive_max_size: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchObservation {
+    pub size: usize,
+    pub bytes: usize,
+    pub elapsed_ms: u128,
+}
+
+fn median_rate(stats: &RouteTransferStats, size: usize) -> Option<f64> {
+    let mut rates: Vec<f64> = stats.observations.iter().filter(|sample| sample.size == size)
+        .map(|sample| sample.bytes as f64 * 1000.0 / sample.elapsed_ms.max(1) as f64).collect();
+    if rates.len() < 3 { return None; }
+    rates.sort_by(f64::total_cmp);
+    Some(rates[rates.len() / 2])
+}
+
+fn observe_batch(stats: &mut RouteTransferStats, size: usize, bytes: usize, elapsed: Duration, min: usize, max: usize) {
+    let elapsed_ms = elapsed.as_millis().saturating_add(std::mem::take(&mut stats.pending_connect_ms)).max(1);
+    stats.observations.push(BatchObservation { size, bytes, elapsed_ms });
+    let same_size = stats.observations.iter().filter(|sample| sample.size == size).count();
+    if same_size > 5 {
+        if let Some(index) = stats.observations.iter().position(|sample| sample.size == size) { stats.observations.remove(index); }
+    }
+    if bytes == 0 {
+        stats.consecutive_failures += 1;
+        if stats.consecutive_failures >= 2 {
+            stats.chosen_batch_size = (size / 2).max(min);
+            stats.cooldown_batches = 4;
+        }
+        return;
+    }
+    stats.consecutive_failures = 0;
+    if stats.cooldown_batches > 0 {
+        stats.cooldown_batches -= 1;
+        return;
+    }
+    let Some(current) = median_rate(stats, size) else { return };
+    let smaller = (size / 2).max(min);
+    if smaller < size && median_rate(stats, smaller).is_some_and(|previous| current < previous * 0.9) {
+        stats.chosen_batch_size = smaller;
+        stats.adaptive_max_size = smaller;
+        stats.cooldown_batches = 4;
+    } else if size < max.min(if stats.adaptive_max_size == 0 { max } else { stats.adaptive_max_size }) {
+        stats.chosen_batch_size = size.saturating_mul(2).min(max).min(if stats.adaptive_max_size == 0 { max } else { stats.adaptive_max_size });
+    }
 }
 
 fn now_unix_ms() -> u128 {
@@ -121,6 +201,7 @@ async fn note_session(shared: &Arc<Mutex<Journal>>, route: &str, connect: Durati
     }
     stats.sessions = stats.sessions.saturating_add(1);
     stats.connect_ms = stats.connect_ms.saturating_add(connect.as_millis());
+    stats.pending_connect_ms = connect.as_millis();
     crate::debug_log!("transfer {}: route {} session opened", journal.id, route);
     save(sftp, &journal).await
 }
@@ -152,6 +233,19 @@ async fn note_error(shared: &Arc<Mutex<Journal>>, route: &str, error: &anyhow::E
     save(sftp, &journal).await
 }
 
+async fn note_failed_batch(shared: &Arc<Mutex<Journal>>, route: &str, selected_size: usize, started: Instant) {
+    let mut journal = shared.lock().await;
+    if journal.adaptive {
+        let min = journal.min_batch_size.max(journal.chunk_size);
+        let max = journal.max_batch_size.max(min);
+        let stats = journal.route_stats.entry(route.to_owned()).or_default();
+        if !stats.fixed_batch_size {
+            observe_batch(stats, selected_size, 0, started.elapsed(), min, max);
+            crate::debug_log!("transfer {}: route {} batch failed; next size {} bytes", journal.id, route, route_batch_size(&journal, route));
+        }
+    }
+}
+
 fn retry_route(error: &anyhow::Error, attempts: u32) -> bool {
     !transport::is_permanent(error) && attempts < MAX_ROUTE_ATTEMPTS
 }
@@ -162,8 +256,10 @@ async fn note_batch(
     route: &str,
     indices: &[usize],
     bytes: usize,
-    elapsed: Duration,
+    selected_size: usize,
+    started: Instant,
 ) -> Result<()> {
+    let elapsed = started.elapsed();
     let mut journal = shared.lock().await;
     for &index in indices {
         journal.complete[index] = true;
@@ -181,6 +277,15 @@ async fn note_batch(
     stats.last_at_unix_ms = now_unix_ms();
     crate::debug_log!("transfer {}: atoms {}..={} offset={} bytes={} route={} elapsed={} ms verified", journal.id, indices[0], indices[indices.len() - 1], indices[0] as u64 * journal.chunk_size as u64, bytes, route, elapsed.as_millis());
     save(sftp, &journal).await?;
+    if journal.adaptive && bytes >= selected_size {
+        let min = journal.min_batch_size.max(journal.chunk_size);
+        let max = journal.max_batch_size.max(min);
+        let stats = journal.route_stats.entry(route.to_owned()).or_default();
+        if !stats.fixed_batch_size {
+            observe_batch(stats, selected_size, bytes, started.elapsed(), min, max);
+            crate::debug_log!("transfer {}: route {} next batch size {} bytes", journal.id, route, route_batch_size(&journal, route));
+        }
+    }
     crate::debug::write_stderr(format_args!(
         "{}: {}/{} chunks via {}",
         journal.id,
@@ -200,6 +305,18 @@ fn claim_group(queue: &mut VecDeque<usize>, max_atoms: usize) -> Vec<usize> {
         group.push(queue.pop_front().expect("front was checked"));
     }
     group
+}
+
+fn route_batch_size(journal: &Journal, route: &str) -> usize {
+    if journal.version < 2 { return journal.chunk_size; }
+    journal.route_stats.get(route).and_then(|stats| (stats.chosen_batch_size > 0).then_some(stats.chosen_batch_size))
+        .unwrap_or(journal.batch_size).max(journal.chunk_size)
+}
+
+fn initial_route_stats(config: &Config) -> BTreeMap<String, RouteTransferStats> {
+    config.route_chunk_sizes.iter().map(|(route, &size)| {
+        (route.clone(), RouteTransferStats { chosen_batch_size: size, fixed_batch_size: true, ..Default::default() })
+    }).collect()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -309,7 +426,10 @@ pub(crate) async fn sftp(connection: &transport::Connection) -> Result<SftpSessi
     crate::debug_log!("SFTP: opening subsystem channel");
     let channel = connection.final_handle().channel_open_session().await?;
     channel.request_subsystem(true, "sftp").await?;
-    Ok(SftpSession::new(channel.into_stream()).await?)
+    Ok(SftpSession::new_with_config(channel.into_stream(), russh_sftp::client::Config {
+        request_timeout_secs: 300,
+        ..Default::default()
+    }).await?)
 }
 
 pub(crate) async fn connect_any(config: &Config, target: &str) -> Result<transport::Connection> {
@@ -368,7 +488,10 @@ pub async fn put(config: &Config, target: &str, source: &Path, destination: &str
     let (size, sha256, source_mtime) = local_hash(source).await?;
     let id = Uuid::new_v4();
     let temporary = format!("{destination}.mssh-{id}.part");
-    let atom_size = ATOM_SIZE.min(config.settings.chunk_size);
+    let atom_size = atom_size(config);
+    let initial_batch_size = if config.auto_chunk {
+        config.settings.chunk_size.clamp(config.min_chunk_size, config.max_chunk_size)
+    } else { config.settings.chunk_size };
     let chunks = size.div_ceil(atom_size as u64) as usize;
     crate::debug_log!("upload {id}: source size={size} bytes, chunks={chunks}, SHA-256 {sha256}");
     let connection = connect_any(config, target).await?;
@@ -385,10 +508,14 @@ pub async fn put(config: &Config, target: &str, source: &Path, destination: &str
         source_mtime,
         sha256,
         chunk_size: atom_size,
-        batch_size: config.settings.chunk_size,
+        batch_size: initial_batch_size,
+        adaptive: config.auto_chunk,
+        min_batch_size: config.min_chunk_size,
+        max_batch_size: config.max_chunk_size,
+        chunk_timeout_secs: config.chunk_timeout_secs,
         complete: vec![false; chunks],
         published: false,
-        route_stats: BTreeMap::new(),
+        route_stats: initial_route_stats(config),
         last_error: None,
         state_dir: state_dir(&sftp).await?,
         worker_host: worker_host(),
@@ -536,11 +663,10 @@ async fn put_worker(
     let sftp = sftp(&connection).await?;
     note_session(&shared, &route.name, connect_started.elapsed(), &sftp).await?;
     let snapshot = shared.lock().await.clone();
-    let max_atoms = if snapshot.version >= 2 {
-        snapshot.batch_size.max(snapshot.chunk_size).div_ceil(snapshot.chunk_size)
-    } else { 1 };
     let mut local = tokio::fs::File::open(&snapshot.source).await?;
     loop {
+        let selected_size = { let state = shared.lock().await; route_batch_size(&state, &route.name) };
+        let max_atoms = (selected_size / snapshot.chunk_size).max(1);
         let group = claim_group(&mut *queue.lock().await, max_atoms);
         if group.is_empty() {
             break;
@@ -548,25 +674,33 @@ async fn put_worker(
         let chunk_started = Instant::now();
         let offset = group[0] as u64 * snapshot.chunk_size as u64;
         let length = (snapshot.size - offset).min(group.len() as u64 * snapshot.chunk_size as u64) as usize;
-        let mut buffer = vec![0u8; length];
-        local.seek(SeekFrom::Start(offset)).await?;
-        local.read_exact(&mut buffer).await?;
-        let mut remote = sftp
-            .open_with_flags(&snapshot.temporary, OpenFlags::WRITE)
-            .await?;
-        remote.seek(SeekFrom::Start(offset)).await?;
-        remote.write_all(&buffer).await?;
-        remote.close().await?;
-        let mut check = sftp.open(&snapshot.temporary).await?;
-        check.seek(SeekFrom::Start(offset)).await?;
-        let mut readback = vec![0u8; length];
-        check.read_exact(&mut readback).await?;
-        check.close().await?;
-        ensure!(
-            Sha256::digest(&buffer) == Sha256::digest(&readback),
-            "remote batch starting at atom {} differs after write", group[0]
-        );
-        note_batch(&shared, &sftp, &route.name, &group, length, chunk_started.elapsed()).await?;
+        let batch_io = async {
+            let mut buffer = vec![0u8; length];
+            local.seek(SeekFrom::Start(offset)).await?;
+            local.read_exact(&mut buffer).await?;
+            let mut remote = sftp.open_with_flags(&snapshot.temporary, OpenFlags::WRITE).await?;
+            remote.seek(SeekFrom::Start(offset)).await?;
+            remote.write_all(&buffer).await?;
+            remote.close().await?;
+            let mut check = sftp.open(&snapshot.temporary).await?;
+            check.seek(SeekFrom::Start(offset)).await?;
+            let mut readback = vec![0u8; length];
+            check.read_exact(&mut readback).await?;
+            check.close().await?;
+            ensure!(Sha256::digest(&buffer) == Sha256::digest(&readback),
+                "remote batch starting at atom {} differs after write", group[0]);
+            Ok::<(), anyhow::Error>(())
+        };
+        let result = tokio::time::timeout(Duration::from_secs(snapshot.chunk_timeout_secs.unwrap_or(120)), batch_io).await;
+        match result {
+            Ok(Ok(())) => {},
+            Ok(Err(error)) => { note_failed_batch(&shared, &route.name, selected_size, chunk_started).await; return Err(error); },
+            Err(_) => {
+                note_failed_batch(&shared, &route.name, selected_size, chunk_started).await;
+                anyhow::bail!("batch starting at atom {} exceeded {} second timeout", group[0], snapshot.chunk_timeout_secs.unwrap_or(120));
+            }
+        }
+        note_batch(&shared, &sftp, &route.name, &group, length, selected_size, chunk_started).await?;
     }
     Ok(())
 }
@@ -626,7 +760,10 @@ pub async fn get(config: &Config, target: &str, source: &str, destination: &Path
     remote.close().await?;
     crate::debug_log!("download: source size={size} bytes, SHA-256 {}", hex::encode(hash.clone().finalize()));
     let id = Uuid::new_v4();
-    let atom_size = ATOM_SIZE.min(config.settings.chunk_size);
+    let atom_size = atom_size(config);
+    let initial_batch_size = if config.auto_chunk {
+        config.settings.chunk_size.clamp(config.min_chunk_size, config.max_chunk_size)
+    } else { config.settings.chunk_size };
     let temporary = format!("{}.mssh-{id}.part", destination.display());
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -649,10 +786,14 @@ pub async fn get(config: &Config, target: &str, source: &str, destination: &Path
         source_mtime,
         sha256: hex::encode(hash.finalize()),
         chunk_size: atom_size,
-        batch_size: config.settings.chunk_size,
+        batch_size: initial_batch_size,
+        adaptive: config.auto_chunk,
+        min_batch_size: config.min_chunk_size,
+        max_batch_size: config.max_chunk_size,
+        chunk_timeout_secs: config.chunk_timeout_secs,
         complete: vec![false; size.div_ceil(atom_size as u64) as usize],
         published: false,
-        route_stats: BTreeMap::new(),
+        route_stats: initial_route_stats(config),
         last_error: None,
         state_dir: state_dir(&sftp).await?,
         worker_host: worker_host(),
@@ -767,9 +908,6 @@ async fn get_worker(
     let sftp = sftp(&connection).await?;
     note_session(&shared, &route.name, connect_started.elapsed(), &sftp).await?;
     let snapshot = shared.lock().await.clone();
-    let max_atoms = if snapshot.version >= 2 {
-        snapshot.batch_size.max(snapshot.chunk_size).div_ceil(snapshot.chunk_size)
-    } else { 1 };
     let metadata = sftp.metadata(&snapshot.source).await?;
     let mtime = metadata
         .modified()
@@ -786,6 +924,8 @@ async fn get_worker(
         .open(&snapshot.temporary)
         .await?;
     loop {
+        let selected_size = { let state = shared.lock().await; route_batch_size(&state, &route.name) };
+        let max_atoms = (selected_size / snapshot.chunk_size).max(1);
         let group = claim_group(&mut *queue.lock().await, max_atoms);
         if group.is_empty() {
             break;
@@ -793,13 +933,25 @@ async fn get_worker(
         let chunk_started = Instant::now();
         let offset = group[0] as u64 * snapshot.chunk_size as u64;
         let length = (snapshot.size - offset).min(group.len() as u64 * snapshot.chunk_size as u64) as usize;
-        remote.seek(SeekFrom::Start(offset)).await?;
-        let mut buffer = vec![0u8; length];
-        remote.read_exact(&mut buffer).await?;
-        local.seek(SeekFrom::Start(offset)).await?;
-        local.write_all(&buffer).await?;
-        local.sync_data().await?;
-        note_batch(&shared, &sftp, &route.name, &group, length, chunk_started.elapsed()).await?;
+        let batch_io = async {
+            remote.seek(SeekFrom::Start(offset)).await?;
+            let mut buffer = vec![0u8; length];
+            remote.read_exact(&mut buffer).await?;
+            local.seek(SeekFrom::Start(offset)).await?;
+            local.write_all(&buffer).await?;
+            local.sync_data().await?;
+            Ok::<(), anyhow::Error>(())
+        };
+        let result = tokio::time::timeout(Duration::from_secs(snapshot.chunk_timeout_secs.unwrap_or(120)), batch_io).await;
+        match result {
+            Ok(Ok(())) => {},
+            Ok(Err(error)) => { note_failed_batch(&shared, &route.name, selected_size, chunk_started).await; return Err(error); },
+            Err(_) => {
+                note_failed_batch(&shared, &route.name, selected_size, chunk_started).await;
+                anyhow::bail!("batch starting at atom {} exceeded {} second timeout", group[0], snapshot.chunk_timeout_secs.unwrap_or(120));
+            }
+        }
+        note_batch(&shared, &sftp, &route.name, &group, length, selected_size, chunk_started).await?;
     }
     remote.close().await?;
     Ok(())
@@ -816,6 +968,41 @@ mod tests {
         assert_eq!(claim_group(&mut pending, 2), [4, 5]);
         assert_eq!(claim_group(&mut pending, 2), [6]);
         assert!(claim_group(&mut pending, 2).is_empty());
+    }
+
+    #[test]
+    fn adaptive_batches_use_medians_and_stop_after_a_slower_size() {
+        let mib = 1024 * 1024;
+        let mut stats = RouteTransferStats::default();
+        for _ in 0..3 { observe_batch(&mut stats, mib, mib, Duration::from_millis(100), 256 * 1024, 8 * mib); }
+        assert_eq!(stats.chosen_batch_size, 2 * mib);
+        for _ in 0..3 { observe_batch(&mut stats, 2 * mib, 2 * mib, Duration::from_millis(300), 256 * 1024, 8 * mib); }
+        assert_eq!(stats.chosen_batch_size, mib);
+        assert_eq!(stats.adaptive_max_size, mib);
+        for _ in 0..10 { observe_batch(&mut stats, mib, mib, Duration::from_millis(100), 256 * 1024, 8 * mib); }
+        assert_eq!(stats.chosen_batch_size, mib);
+    }
+
+    #[test]
+    fn one_failure_does_not_shrink_but_two_do() {
+        let mib = 1024 * 1024;
+        let mut stats = RouteTransferStats { chosen_batch_size: 2 * mib, ..Default::default() };
+        observe_batch(&mut stats, 2 * mib, 0, Duration::from_millis(500), 256 * 1024, 8 * mib);
+        assert_eq!(stats.chosen_batch_size, 2 * mib);
+        observe_batch(&mut stats, 2 * mib, 2 * mib, Duration::from_millis(100), 256 * 1024, 8 * mib);
+        assert_eq!(stats.consecutive_failures, 0);
+        observe_batch(&mut stats, 2 * mib, 0, Duration::from_millis(500), 256 * 1024, 8 * mib);
+        observe_batch(&mut stats, 2 * mib, 0, Duration::from_millis(500), 256 * 1024, 8 * mib);
+        assert_eq!(stats.chosen_batch_size, mib);
+    }
+
+    #[test]
+    fn connection_time_is_part_of_first_batch_observation() {
+        let mib = 1024 * 1024;
+        let mut stats = RouteTransferStats { pending_connect_ms: 250, ..Default::default() };
+        observe_batch(&mut stats, mib, mib, Duration::from_millis(100), 256 * 1024, 8 * mib);
+        assert_eq!(stats.observations[0].elapsed_ms, 350);
+        assert_eq!(stats.pending_connect_ms, 0);
     }
 
     #[cfg(unix)]

@@ -22,7 +22,15 @@ struct Cli {
     #[arg(long)]
     max_routes: Option<usize>,
     #[arg(long)]
-    chunk_size: Option<usize>,
+    chunk_size: Option<String>,
+    #[arg(long)]
+    min_chunk_size: Option<String>,
+    #[arg(long)]
+    max_chunk_size: Option<String>,
+    #[arg(long = "route-chunk")]
+    route_chunks: Vec<String>,
+    #[arg(long)]
+    chunk_timeout: Option<u64>,
     #[arg(short = 'r', long)]
     recursive: bool,
     #[arg(short = 'd', long)]
@@ -64,17 +72,39 @@ async fn run() -> Result<()> {
     }
     config.route_filter = cli.routes.clone();
     debug_log!("selected routes: {}", if cli.routes.is_empty() { "all".to_owned() } else { cli.routes.join(", ") });
-    if let Some(chunk_size) = cli.chunk_size {
-        ensure!((64 * 1024..=8 * 1024 * 1024).contains(&chunk_size), "chunk size must be 64 KiB..8 MiB");
-        config.settings.chunk_size = chunk_size;
+    if let Some(chunk_size) = &cli.chunk_size {
+        if chunk_size.eq_ignore_ascii_case("auto") {
+            config.auto_chunk = true;
+        } else {
+            config.settings.chunk_size = parse_size(chunk_size)?;
+            config.auto_chunk = false;
+        }
+    }
+    if let Some(size) = &cli.min_chunk_size { config.min_chunk_size = parse_size(size)?; }
+    if let Some(size) = &cli.max_chunk_size { config.max_chunk_size = parse_size(size)?; }
+    ensure!(config.min_chunk_size >= 64 * 1024 && config.max_chunk_size <= 32 * 1024 * 1024
+        && config.min_chunk_size <= config.max_chunk_size, "chunk limits must be 64 KiB..32 MiB with min <= max");
+    config.chunk_timeout_secs = cli.chunk_timeout;
+    ensure!(config.chunk_timeout_secs.is_none_or(|secs| (1..=300).contains(&secs)), "chunk timeout must be 1..=300 seconds");
+    for override_spec in &cli.route_chunks {
+        let (route, size) = override_spec.split_once('=').context("route-chunk must be ROUTE=SIZE")?;
+        ensure!(config.effective_routes().iter().any(|r| r.name == route && !r.disabled), "unknown or disabled route: {route}");
+        let size = parse_size(size)?;
+        ensure!((64 * 1024..=32 * 1024 * 1024).contains(&size), "route chunk size must be 64 KiB..32 MiB");
+        config.route_chunk_sizes.insert(route.to_owned(), size);
     }
     if let Some(max_routes) = cli.max_routes {
-        ensure!(max_routes > 0, "max-routes must be positive");
+        ensure!((1..=16).contains(&max_routes), "max-routes must be 1..=16");
         config.settings.max_parallel_routes = max_routes;
     } else {
         config.settings.max_parallel_routes = config.effective_routes().len().max(1);
     }
-    debug_log!("transfer settings: max_routes={}, chunk_size={} bytes", config.settings.max_parallel_routes, config.settings.chunk_size);
+    config.settings.max_parallel_routes = config.settings.max_parallel_routes.min(16);
+    let largest_batch = if config.auto_chunk { config.max_chunk_size } else { config.settings.chunk_size }
+        .max(config.route_chunk_sizes.values().copied().max().unwrap_or(0));
+    ensure!(largest_batch.saturating_mul(config.settings.max_parallel_routes).saturating_mul(2) <= 256 * 1024 * 1024,
+        "chunk sizes and parallel routes exceed the 256 MiB transfer buffer budget");
+    debug_log!("transfer settings: max_routes={}, chunk_mode={}, initial_chunk={} bytes, min={}, max={}", config.settings.max_parallel_routes, if config.auto_chunk { "auto" } else { "fixed" }, config.settings.chunk_size, config.min_chunk_size, config.max_chunk_size);
     let unpinned: Vec<_> = config.nodes.iter().filter_map(|(id, node)| node.host_key.is_none().then_some(id.as_str())).collect();
     if !unpinned.is_empty() {
         eprintln!("warning: SSH host keys are not verified for nodes: {}", unpinned.join(", "));
@@ -135,12 +165,30 @@ fn atty_stdin() -> bool {
     std::io::IsTerminal::is_terminal(&io::stdin())
 }
 
+fn parse_size(input: &str) -> Result<usize> {
+    let lower = input.to_ascii_lowercase();
+    let (number, scale) = if let Some(value) = lower.strip_suffix("mib") { (value, 1024 * 1024) }
+        else if let Some(value) = lower.strip_suffix("kib") { (value, 1024) }
+        else if let Some(value) = lower.strip_suffix("mb") { (value, 1000 * 1000) }
+        else if let Some(value) = lower.strip_suffix("kb") { (value, 1000) }
+        else { (lower.as_str(), 1) };
+    let value = number.parse::<usize>().with_context(|| format!("invalid size: {input}"))?;
+    let bytes = value.checked_mul(scale).context("size is too large")?;
+    ensure!((64 * 1024..=32 * 1024 * 1024).contains(&bytes), "size must be 64 KiB..32 MiB");
+    ensure!(bytes.is_multiple_of(64 * 1024), "size must be a multiple of 64 KiB");
+    Ok(bytes)
+}
+
 fn spawn_worker(cli: &Cli, config_path: &std::path::Path, action: PartialAction) -> Result<()> {
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg("--config").arg(config_path);
     for route in &cli.routes { cmd.arg("--route").arg(route); }
     if let Some(n) = cli.max_routes { cmd.arg("--max-routes").arg(n.to_string()); }
-    if let Some(n) = cli.chunk_size { cmd.arg("--chunk-size").arg(n.to_string()); }
+    if let Some(n) = &cli.chunk_size { cmd.arg("--chunk-size").arg(n); }
+    if let Some(n) = &cli.min_chunk_size { cmd.arg("--min-chunk-size").arg(n); }
+    if let Some(n) = &cli.max_chunk_size { cmd.arg("--max-chunk-size").arg(n); }
+    for route_chunk in &cli.route_chunks { cmd.arg("--route-chunk").arg(route_chunk); }
+    if let Some(seconds) = cli.chunk_timeout { cmd.arg("--chunk-timeout").arg(seconds.to_string()); }
     if cli.recursive { cmd.arg("-r"); }
     if cli.debug { cmd.arg("--debug"); }
     cmd.arg("--worker-action").arg(match action {
@@ -172,7 +220,7 @@ async fn show_transfers(config: &Config, target: &str, json: bool) -> Result<()>
             let done = j.complete.iter().filter(|&&x| x).count();
             println!("{} {:?} {} -> {} {}/{} chunks{}", j.id, j.direction, j.source, j.destination, done, j.complete.len(), if j.published { " [done]" } else { " [partial]" });
             if let Some(error) = &j.last_error { println!("  error: {error}"); }
-            for (route, stats) in j.route_stats { println!("  {route}: {} bytes, connect {} ms, session {} ms, failed {} ms, errors {}, reconnects {}", stats.bytes, stats.connect_ms, stats.session_ms, stats.failed_session_ms, stats.errors, stats.reconnects); }
+            for (route, stats) in j.route_stats { println!("  {route}: {} bytes, batch {} bytes, connect {} ms, session {} ms, failed {} ms, errors {}, reconnects {}", stats.bytes, if stats.chosen_batch_size > 0 { stats.chosen_batch_size } else { j.batch_size.max(j.chunk_size) }, stats.connect_ms, stats.session_ms, stats.failed_session_ms, stats.errors, stats.reconnects); }
         }
     }
     Ok(())
@@ -216,7 +264,7 @@ async fn show_status(config: &Config, target: Option<&str>, json: bool, details:
                 println!("transfer {} on {}: {:?} {}/{} chunks{}", j.id, node, j.direction, done, j.complete.len(), if j.published { " [done]" } else { " [partial]" });
                 if let Some(error) = &j.last_error { println!("  error: {error}"); }
                 if details {
-                    for (route, stats) in j.route_stats { println!("  {route}: {} bytes, connect {} ms, session {} ms, failed {} ms, errors {}, reconnects {}", stats.bytes, stats.connect_ms, stats.session_ms, stats.failed_session_ms, stats.errors, stats.reconnects); }
+                    for (route, stats) in j.route_stats { println!("  {route}: {} bytes, batch {} bytes, connect {} ms, session {} ms, failed {} ms, errors {}, reconnects {}", stats.bytes, if stats.chosen_batch_size > 0 { stats.chosen_batch_size } else { j.batch_size.max(j.chunk_size) }, stats.connect_ms, stats.session_ms, stats.failed_session_ms, stats.errors, stats.reconnects); }
                 }
             }
         }
@@ -246,5 +294,12 @@ mod tests {
         let detailed_status = Cli::try_parse_from(["mssh", "status", "edge_a", "--details"]).unwrap();
         assert!(detailed_status.details);
         assert!(!detailed_status.debug);
+        let tuned = Cli::try_parse_from(["mssh", "--chunk-size", "auto", "--min-chunk-size", "320KiB",
+            "--max-chunk-size", "4MiB", "--route-chunk", "via-a=512KiB", "--chunk-timeout", "30",
+            "./test.yml", "edge_a:/home"]).unwrap();
+        assert_eq!(tuned.chunk_size.as_deref(), Some("auto"));
+        assert_eq!(tuned.route_chunks, ["via-a=512KiB"]);
+        assert_eq!(parse_size("320KiB").unwrap(), 320 * 1024);
+        assert!(parse_size("300KB").is_err());
     }
 }
