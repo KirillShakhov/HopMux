@@ -109,6 +109,7 @@ async fn note_session(shared: &Arc<Mutex<Journal>>, route: &str, sftp: &SftpSess
         stats.reconnects = stats.reconnects.saturating_add(1);
     }
     stats.sessions = stats.sessions.saturating_add(1);
+    crate::debug_log!("transfer {}: route {} session opened", journal.id, route);
     save(sftp, &journal).await
 }
 
@@ -118,6 +119,7 @@ async fn note_error(shared: &Arc<Mutex<Journal>>, route: &str, error: &anyhow::E
     let stats = journal.route_stats.entry(route.to_owned()).or_default();
     stats.errors = stats.errors.saturating_add(1);
     journal.last_error = Some(format!("{error:#}"));
+    crate::debug_log!("transfer {}: route {} error: {error:#}", journal.id, route);
     save(sftp, &journal).await
 }
 
@@ -146,6 +148,7 @@ async fn note_chunk(
             .map_or(sample_bps, |old| old * 0.7 + sample_bps * 0.3),
     );
     stats.last_at_unix_ms = now_unix_ms();
+    crate::debug_log!("transfer {}: chunk {} offset={} bytes={} route={} elapsed={} ms verified", journal.id, index, index as u64 * journal.chunk_size as u64, bytes, route, elapsed.as_millis());
     save(sftp, &journal).await?;
     eprintln!(
         "{}: {}/{} chunks via {}",
@@ -175,6 +178,7 @@ async fn state_dir(sftp: &SftpSession) -> Result<String> {
         sftp.create_dir(&dir).await?;
     }
     sftp.set_metadata(&dir, FileAttributes { permissions: Some(0o700), ..Default::default() }).await?;
+    crate::debug_log!("transfer state: remote directory {dir}");
     Ok(dir)
 }
 
@@ -190,6 +194,7 @@ async fn save(sftp: &SftpSession, journal: &Journal) -> Result<()> {
     ).await?;
     file.write_all(&bytes).await?;
     file.close().await?;
+    crate::debug_log!("transfer {}: wrote {} journal bytes to remote temporary file", journal.id, bytes.len());
     if sftp.try_exists(&backup).await? {
         if sftp.try_exists(&path).await? { sftp.remove_file(&backup).await?; }
         else { sftp.rename(&backup, &path).await?; }
@@ -201,6 +206,7 @@ async fn save(sftp: &SftpSession, journal: &Journal) -> Result<()> {
         return Err(error.into());
     }
     if had_previous { let _ = sftp.remove_file(&backup).await; }
+    crate::debug_log!("transfer {}: remote journal committed, {}/{} chunks complete", journal.id, journal.complete.iter().filter(|&&done| done).count(), journal.complete.len());
     Ok(())
 }
 
@@ -209,6 +215,7 @@ async fn remove_stale_journal_writes(sftp: &SftpSession, journal: &Journal) -> R
     for entry in sftp.read_dir(&journal.state_dir).await? {
         let name = entry.file_name();
         if name.starts_with(&prefix) {
+            crate::debug_log!("transfer {}: removing abandoned journal write {name}", journal.id);
             sftp.remove_file(format!("{}/{name}", journal.state_dir)).await?;
         }
     }
@@ -216,6 +223,7 @@ async fn remove_stale_journal_writes(sftp: &SftpSession, journal: &Journal) -> R
 }
 
 pub async fn list(config: &Config, target: &str) -> Result<Vec<Journal>> {
+    crate::debug_log!("transfer state: listing journals for {target}");
     let connection = connect_any(config, target).await?;
     let sftp = sftp(&connection).await?;
     let dir = state_dir(&sftp).await?;
@@ -232,10 +240,12 @@ pub async fn list(config: &Config, target: &str) -> Result<Vec<Journal>> {
             }
         }
     }
+    crate::debug_log!("transfer state: found {} journals for {target}", journals.len());
     Ok(journals.into_values().collect())
 }
 
 pub async fn discard(config: &Config, journal: &Journal) -> Result<()> {
+    crate::debug_log!("transfer {}: discarding partial data and remote journal", journal.id);
     ensure!(!is_active(journal), "transfer is still active");
     let connection = connect_any(config, &journal.target).await?;
     let sftp = sftp(&connection).await?;
@@ -254,6 +264,7 @@ pub async fn discard(config: &Config, journal: &Journal) -> Result<()> {
 }
 
 pub(crate) async fn sftp(connection: &transport::Connection) -> Result<SftpSession> {
+    crate::debug_log!("SFTP: opening subsystem channel");
     let channel = connection.final_handle().channel_open_session().await?;
     channel.request_subsystem(true, "sftp").await?;
     Ok(SftpSession::new(channel.into_stream()).await?)
@@ -262,15 +273,17 @@ pub(crate) async fn sftp(connection: &transport::Connection) -> Result<SftpSessi
 pub(crate) async fn connect_any(config: &Config, target: &str) -> Result<transport::Connection> {
     let mut last_error = None;
     for route in config.routes_for(target) {
+        crate::debug_log!("SFTP: trying route {} to {target}", route.name);
         match transport::connect(config, &route).await {
-            Ok(connection) => return Ok(connection),
-            Err(error) => last_error = Some(error),
+            Ok(connection) => { crate::debug_log!("SFTP: route {} connected", route.name); return Ok(connection) },
+            Err(error) => { crate::debug_log!("SFTP: route {} failed: {error:#}", route.name); last_error = Some(error) },
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no route to target {target}")))
 }
 
 async fn local_hash(path: &Path) -> Result<(u64, String, Option<u64>)> {
+    crate::debug_log!("hash: reading local file {}", path.display());
     let mut file = tokio::fs::File::open(path).await?;
     let metadata = file.metadata().await?;
     ensure!(metadata.is_file(), "source is not a regular file");
@@ -297,10 +310,13 @@ async fn local_hash(path: &Path) -> Result<(u64, String, Option<u64>)> {
             && after.modified()? == metadata.modified()?,
         "source changed while hashing"
     );
-    Ok((metadata.len(), hex::encode(hash.finalize()), modified))
+    let digest = hex::encode(hash.finalize());
+    crate::debug_log!("hash: {} bytes read from {}, SHA-256 {}", metadata.len(), path.display(), digest);
+    Ok((metadata.len(), digest, modified))
 }
 
 pub async fn put(config: &Config, target: &str, source: &Path, destination: &str) -> Result<Uuid> {
+    crate::debug_log!("upload: {} -> {}:{}", source.display(), target, destination);
     let routes = config.routes_for(target);
     ensure!(!routes.is_empty(), "no route to target {target}");
     ensure!(
@@ -311,6 +327,7 @@ pub async fn put(config: &Config, target: &str, source: &Path, destination: &str
     let id = Uuid::new_v4();
     let temporary = format!("{destination}.mssh-{id}.part");
     let chunks = size.div_ceil(config.settings.chunk_size as u64) as usize;
+    crate::debug_log!("upload {id}: source size={size} bytes, chunks={chunks}, SHA-256 {sha256}");
     let connection = connect_any(config, target).await?;
     let sftp = sftp(&connection).await?;
     let mut journal = Journal {
@@ -344,6 +361,7 @@ pub async fn put(config: &Config, target: &str, source: &Path, destination: &str
         )
         .await?;
     file.close().await?;
+    crate::debug_log!("upload {id}: created remote part {}", journal.temporary);
     if let Err(error) = save(&sftp, &journal).await {
         let _ = sftp.remove_file(&journal.temporary).await;
         return Err(error);
@@ -353,6 +371,7 @@ pub async fn put(config: &Config, target: &str, source: &Path, destination: &str
 }
 
 async fn process_put(config: &Config, journal: &mut Journal) -> Result<()> {
+    crate::debug_log!("upload {}: processing {} pending chunks", journal.id, journal.complete.iter().filter(|&&done| !done).count());
     let source = Path::new(&journal.source);
     let (size, sha256, mtime) = local_hash(source).await?;
     ensure!(
@@ -365,6 +384,7 @@ async fn process_put(config: &Config, journal: &mut Journal) -> Result<()> {
         .take(config.settings.max_parallel_routes)
         .collect();
     ensure!(!routes.is_empty(), "no route to target {}", journal.target);
+    crate::debug_log!("upload {}: using routes {}", journal.id, routes.iter().map(|route| route.name.as_str()).collect::<Vec<_>>().join(", "));
     let control_connection = connect_any(config, &journal.target).await?;
     let control_sftp = sftp(&control_connection).await?;
     let shared = Arc::new(Mutex::new(journal.clone()));
@@ -382,6 +402,7 @@ async fn process_put(config: &Config, journal: &mut Journal) -> Result<()> {
         if pending.is_empty() {
             break;
         }
+        crate::debug_log!("upload {}: scheduling {} chunks", journal.id, pending.len());
         ensure!(
             !routes.is_empty(),
             "all routes failed; transfer can be resumed later"
@@ -430,10 +451,12 @@ async fn process_put(config: &Config, journal: &mut Journal) -> Result<()> {
         hash.update(&buffer[..count]);
     }
     remote.close().await?;
+    crate::debug_log!("upload {}: full remote part read for SHA-256 verification", journal.id);
     ensure!(
         hex::encode(hash.finalize()) == journal.sha256,
         "remote SHA-256 differs; temporary file retained"
     );
+    crate::debug_log!("upload {}: remote SHA-256 verified", journal.id);
     ensure!(
         !sftp.try_exists(&journal.destination).await?,
         "destination appeared during upload"
@@ -447,6 +470,7 @@ async fn process_put(config: &Config, journal: &mut Journal) -> Result<()> {
         journal.temporary
     );
     journal.published = true;
+    crate::debug_log!("upload {}: published {}", journal.id, journal.destination);
     save(&sftp, journal).await?;
     // The published name is safe now; cleanup failure is nonfatal.
     let _ = sftp.remove_file(&journal.temporary).await;
@@ -495,6 +519,7 @@ async fn put_worker(
 }
 
 pub async fn continue_transfer(config: &Config, journal: &Journal) -> Result<()> {
+    crate::debug_log!("transfer {}: continuing {:?} to {}", journal.id, journal.direction, journal.destination);
     let mut journal = journal.clone();
     ensure!(!journal.published, "transfer already published");
     ensure!(!is_active(&journal), "transfer is still active");
@@ -514,6 +539,7 @@ pub async fn continue_transfer(config: &Config, journal: &Journal) -> Result<()>
 }
 
 pub async fn get(config: &Config, target: &str, source: &str, destination: &Path) -> Result<Uuid> {
+    crate::debug_log!("download: {}:{} -> {}", target, source, destination.display());
     let routes = config.routes_for(target);
     ensure!(!routes.is_empty(), "no route to target {target}");
     ensure!(
@@ -545,6 +571,7 @@ pub async fn get(config: &Config, target: &str, source: &str, destination: &Path
         hash.update(&buffer[..n]);
     }
     remote.close().await?;
+    crate::debug_log!("download: source size={size} bytes, SHA-256 {}", hex::encode(hash.clone().finalize()));
     let id = Uuid::new_v4();
     let temporary = format!("{}.mssh-{id}.part", destination.display());
     let mut options = fs::OpenOptions::new();
@@ -555,6 +582,7 @@ pub async fn get(config: &Config, target: &str, source: &str, destination: &Path
         options.mode(0o600);
     }
     options.open(&temporary)?;
+    crate::debug_log!("download {id}: created local part {temporary}");
     let mut journal = Journal {
         id,
         direction: Direction::Get,
@@ -584,12 +612,14 @@ pub async fn get(config: &Config, target: &str, source: &str, destination: &Path
 }
 
 async fn process_get(config: &Config, journal: &mut Journal) -> Result<()> {
+    crate::debug_log!("download {}: processing {} pending chunks", journal.id, journal.complete.iter().filter(|&&done| !done).count());
     let mut routes: Vec<Route> = config
         .routes_for(&journal.target)
         .into_iter()
         .take(config.settings.max_parallel_routes)
         .collect();
     ensure!(!routes.is_empty(), "no route to target {}", journal.target);
+    crate::debug_log!("download {}: using routes {}", journal.id, routes.iter().map(|route| route.name.as_str()).collect::<Vec<_>>().join(", "));
     ensure!(
         !Path::new(&journal.destination).exists(),
         "local destination already exists"
@@ -615,6 +645,7 @@ async fn process_get(config: &Config, journal: &mut Journal) -> Result<()> {
         if pending.is_empty() {
             break;
         }
+        crate::debug_log!("download {}: scheduling {} chunks", journal.id, pending.len());
         ensure!(
             !routes.is_empty(),
             "all routes failed; transfer can be resumed later"
@@ -655,10 +686,12 @@ async fn process_get(config: &Config, journal: &mut Journal) -> Result<()> {
         size == journal.size && sha256 == journal.sha256,
         "downloaded SHA-256 differs; temporary file retained"
     );
+    crate::debug_log!("download {}: local SHA-256 verified", journal.id);
     let destination = Path::new(&journal.destination);
     fs::hard_link(&journal.temporary, destination)
         .context("cannot publish without overwriting destination")?;
     journal.published = true;
+    crate::debug_log!("download {}: published {}", journal.id, journal.destination);
     save(&control_sftp, journal).await?;
     let _ = fs::remove_file(&journal.temporary);
     Ok(())
