@@ -30,11 +30,15 @@ mssh -r ./project edge_a:/home/niias
 mssh -d edge_a:/home/niias/test.yml ./downloads/
 mssh transfers edge_a
 mssh status edge_a --details
+mssh --debug status edge_a
+mssh --debug edge_a:/home/niias/test.yml ./downloads/
 mssh status --json
 mssh config check
 ```
 
 Copying to an existing directory appends the source name, as with `scp`. Remote paths must be absolute. Use `-r` for directories. All available routes are used for file transfers by default; `--route NAME` selects a route and can be repeated. `--max-routes N` limits the number used concurrently, and `--chunk-size BYTES` sets the chunk size (64 KiB to 8 MiB).
+
+`--debug` works with every command and writes timestamped operation logs to stderr, including route selection, SSH authentication method, SFTP activity, block offsets, verification, and remote journal updates. It does not print passwords or file contents. `--details` only adds information to the `status` report. With `-d --debug`, the worker keeps writing to the current terminal's stderr while that terminal remains open; no client log file is created.
 
 An interrupted file copy leaves a partial file and a journal under `~/.mssh/transfers` on the destination SSH server. For downloads, the journal is on the source SSH server and the local `.part` contains only downloaded file data. Repeat the same copy command to choose whether to continue or restart. A second worker is rejected while the first is active. For noninteractive use, pass `--continue-partial` or `--restart`. `-d` starts a detached transfer worker; it also accepts those two options when a partial transfer already exists. `mssh transfers TARGET` reads the remote journals. There is no local transfer journal or status cache.
 

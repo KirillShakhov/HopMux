@@ -150,13 +150,13 @@ async fn note_chunk(
     stats.last_at_unix_ms = now_unix_ms();
     crate::debug_log!("transfer {}: chunk {} offset={} bytes={} route={} elapsed={} ms verified", journal.id, index, index as u64 * journal.chunk_size as u64, bytes, route, elapsed.as_millis());
     save(sftp, &journal).await?;
-    eprintln!(
+    crate::debug::write_stderr(format_args!(
         "{}: {}/{} chunks via {}",
         journal.id,
         journal.complete.iter().filter(|&&done| done).count(),
         journal.complete.len(),
         route
-    );
+    ));
     Ok(())
 }
 
@@ -422,7 +422,7 @@ async fn process_put(config: &Config, journal: &mut Journal) -> Result<()> {
         while let Some(result) = workers.join_next().await {
             let (name, outcome) = result?;
             if let Err(error) = outcome {
-                eprintln!("route {name}: {error:#}");
+                crate::debug::write_stderr(format_args!("route {name}: {error:#}"));
                 note_error(&shared, &name, &error, &control_sftp).await?;
                 let attempts = failures.entry(name.clone()).or_default();
                 *attempts += 1;
@@ -665,7 +665,7 @@ async fn process_get(config: &Config, journal: &mut Journal) -> Result<()> {
         while let Some(result) = workers.join_next().await {
             let (name, outcome) = result?;
             if let Err(error) = outcome {
-                eprintln!("route {name}: {error:#}");
+                crate::debug::write_stderr(format_args!("route {name}: {error:#}"));
                 note_error(&shared, &name, &error, &control_sftp).await?;
                 let attempts = failures.entry(name.clone()).or_default();
                 *attempts += 1;

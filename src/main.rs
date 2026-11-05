@@ -240,5 +240,11 @@ mod tests {
         assert!(upload.background);
         assert!(upload.continue_partial);
         assert_eq!(upload.routes, ["via-a"]);
+        let debug_status = Cli::try_parse_from(["mssh", "--debug", "status", "edge_a"]).unwrap();
+        assert!(debug_status.debug);
+        assert!(!debug_status.details);
+        let detailed_status = Cli::try_parse_from(["mssh", "status", "edge_a", "--details"]).unwrap();
+        assert!(detailed_status.details);
+        assert!(!detailed_status.debug);
     }
 }

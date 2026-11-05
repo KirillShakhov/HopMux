@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    io::{self, Write},
     sync::{OnceLock, atomic::{AtomicBool, Ordering}},
     time::Instant,
 };
@@ -15,8 +16,12 @@ pub fn init(enabled: bool) {
 pub fn log(message: fmt::Arguments<'_>) {
     if ENABLED.load(Ordering::Relaxed) {
         let elapsed = START.get_or_init(Instant::now).elapsed().as_millis();
-        eprintln!("[debug +{elapsed}ms] {message}");
+        write_stderr(format_args!("[debug +{elapsed}ms] {message}"));
     }
+}
+
+pub fn write_stderr(message: fmt::Arguments<'_>) {
+    let _ = writeln!(io::stderr().lock(), "{message}");
 }
 
 #[macro_export]

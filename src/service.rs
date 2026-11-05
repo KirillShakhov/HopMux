@@ -25,8 +25,9 @@ pub fn auth_statuses(config: &Config) -> Vec<AuthStatus> {
             .is_some_and(|name| std::env::var_os(name).is_some());
         let agent_available = node.agent && cfg!(unix) && std::env::var_os("SSH_AUTH_SOCK")
             .is_some_and(|path| Path::new(&path).exists());
-        AuthStatus { node: id.clone(), key_available, password_available, agent_available,
-            usable: key_available || password_available || agent_available }
+        let usable = key_available || password_available || agent_available;
+        crate::debug_log!("status: auth {} key={} password={} agent={} usable={}", id, key_available, password_available, agent_available, usable);
+        AuthStatus { node: id.clone(), key_available, password_available, agent_available, usable }
     }).collect()
 }
 
