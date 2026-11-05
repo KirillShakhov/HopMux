@@ -1,4 +1,5 @@
 mod config;
+mod debug;
 mod directory;
 mod service;
 mod terminal;
@@ -30,6 +31,8 @@ struct Cli {
     json: bool,
     #[arg(long)]
     details: bool,
+    #[arg(long)]
+    debug: bool,
     #[arg(long, conflicts_with = "restart")]
     continue_partial: bool,
     #[arg(long, conflicts_with = "continue_partial")]
@@ -50,12 +53,17 @@ async fn main() {
 
 async fn run() -> Result<()> {
     let cli = Cli::parse();
+    debug::init(cli.debug);
+    debug_log!("command: {:?}", cli.args);
     let path = cli.config.clone().unwrap_or(config::default_path()?);
+    debug_log!("loading configuration from {}", path.display());
     let mut config = Config::load(&path)?;
+    debug_log!("configuration loaded: {} nodes, {} routes", config.nodes.len(), config.effective_routes().len());
     for name in &cli.routes {
         ensure!(config.effective_routes().iter().any(|r| &r.name == name && !r.disabled), "unknown or disabled route: {name}");
     }
     config.route_filter = cli.routes.clone();
+    debug_log!("selected routes: {}", if cli.routes.is_empty() { "all".to_owned() } else { cli.routes.join(", ") });
     if let Some(chunk_size) = cli.chunk_size {
         ensure!((64 * 1024..=8 * 1024 * 1024).contains(&chunk_size), "chunk size must be 64 KiB..8 MiB");
         config.settings.chunk_size = chunk_size;
@@ -66,25 +74,36 @@ async fn run() -> Result<()> {
     } else {
         config.settings.max_parallel_routes = config.effective_routes().len().max(1);
     }
+    debug_log!("transfer settings: max_routes={}, chunk_size={} bytes", config.settings.max_parallel_routes, config.settings.chunk_size);
     let unpinned: Vec<_> = config.nodes.iter().filter_map(|(id, node)| node.host_key.is_none().then_some(id.as_str())).collect();
     if !unpinned.is_empty() {
         eprintln!("warning: SSH host keys are not verified for nodes: {}", unpinned.join(", "));
     }
     match cli.args.as_slice() {
         [cmd, check] if cmd == "config" && check == "check" => {
+            debug_log!("validating configuration");
             println!("config OK: {} nodes, {} routes", config.nodes.len(), config.effective_routes().len());
         }
-        [cmd, target] if cmd == "transfers" => show_transfers(&config, target, cli.json).await?,
+        [cmd, target] if cmd == "transfers" => {
+            debug_log!("listing transfers for {target}");
+            show_transfers(&config, target, cli.json).await?
+        },
         [cmd] if cmd == "status" => show_status(&config, None, cli.json, cli.details).await?,
         [cmd, target] if cmd == "status" => show_status(&config, Some(target), cli.json, cli.details).await?,
-        [target] if config.nodes.contains_key(target) => service::ssh(&config, target).await?,
+        [target] if config.nodes.contains_key(target) => {
+            debug_log!("opening SSH shell to {target}");
+            service::ssh(&config, target).await?
+        },
         [source, destination] => {
+            debug_log!("preparing copy: {source} -> {destination}");
             let plan = service::prepare_copy(&config, source, destination, cli.recursive).await?;
             let action = choose_action(&cli, &plan)?;
             if cli.background {
+                debug_log!("starting background copy worker");
                 spawn_worker(&cli, &path, action)?;
                 println!("transfer started in background");
             } else {
+                debug_log!("running copy in foreground");
                 service::execute_copy(&config, plan, action).await?;
                 println!("transfer complete");
             }
@@ -95,9 +114,10 @@ async fn run() -> Result<()> {
 }
 
 fn choose_action(cli: &Cli, plan: &service::CopyPlan) -> Result<PartialAction> {
-    if plan.partial.is_none() { return Ok(PartialAction::New); }
-    if cli.continue_partial || cli.worker_action.as_deref() == Some("continue") { return Ok(PartialAction::Continue); }
-    if cli.restart || cli.worker_action.as_deref() == Some("restart") { return Ok(PartialAction::Restart); }
+    if plan.partial.is_none() { debug_log!("no partial transfer found"); return Ok(PartialAction::New); }
+    debug_log!("partial transfer found: {}", plan.partial.as_ref().unwrap().id);
+    if cli.continue_partial || cli.worker_action.as_deref() == Some("continue") { debug_log!("continuing partial transfer"); return Ok(PartialAction::Continue); }
+    if cli.restart || cli.worker_action.as_deref() == Some("restart") { debug_log!("restarting partial transfer"); return Ok(PartialAction::Restart); }
     ensure!(cli.worker_action.is_none(), "partial transfer appeared after background worker started; choose --continue-partial or --restart");
     ensure!(!cli.background || atty_stdin(), "partial transfer exists; use --continue-partial or --restart with -d");
     eprint!("Partial transfer found. [c]ontinue or [r]estart? ");
@@ -105,8 +125,8 @@ fn choose_action(cli: &Cli, plan: &service::CopyPlan) -> Result<PartialAction> {
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
     match answer.trim().to_ascii_lowercase().as_str() {
-        "c" | "continue" => Ok(PartialAction::Continue),
-        "r" | "restart" => Ok(PartialAction::Restart),
+        "c" | "continue" => { debug_log!("user selected continue"); Ok(PartialAction::Continue) },
+        "r" | "restart" => { debug_log!("user selected restart"); Ok(PartialAction::Restart) },
         _ => bail!("transfer left unchanged"),
     }
 }
@@ -122,10 +142,12 @@ fn spawn_worker(cli: &Cli, config_path: &std::path::Path, action: PartialAction)
     if let Some(n) = cli.max_routes { cmd.arg("--max-routes").arg(n.to_string()); }
     if let Some(n) = cli.chunk_size { cmd.arg("--chunk-size").arg(n.to_string()); }
     if cli.recursive { cmd.arg("-r"); }
+    if cli.debug { cmd.arg("--debug"); }
     cmd.arg("--worker-action").arg(match action {
         PartialAction::Continue => "continue", PartialAction::Restart => "restart", PartialAction::New => "new",
     });
-    cmd.args(&cli.args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    cmd.args(&cli.args).stdin(Stdio::null()).stdout(Stdio::null())
+        .stderr(if cli.debug { Stdio::inherit() } else { Stdio::null() });
     #[cfg(unix)] {
         use std::os::unix::process::CommandExt;
         unsafe { cmd.pre_exec(|| { if libc::setsid() < 0 { return Err(io::Error::last_os_error()); } Ok(()) }); }
@@ -135,6 +157,7 @@ fn spawn_worker(cli: &Cli, config_path: &std::path::Path, action: PartialAction)
         cmd.creation_flags(0x00000008 | 0x00000200);
     }
     let child = cmd.spawn().context("cannot start background transfer")?;
+    debug_log!("background worker spawned with pid {}", child.id());
     println!("worker pid: {}", child.id());
     Ok(())
 }
@@ -142,6 +165,7 @@ fn spawn_worker(cli: &Cli, config_path: &std::path::Path, action: PartialAction)
 async fn show_transfers(config: &Config, target: &str, json: bool) -> Result<()> {
     ensure!(config.nodes.contains_key(target), "unknown target: {target}");
     let journals = transfer::list(config, target).await?;
+    debug_log!("found {} transfer journals on {target}", journals.len());
     if json { println!("{}", serde_json::to_string_pretty(&journals)?); }
     else {
         for j in journals {
@@ -157,6 +181,7 @@ async fn show_transfers(config: &Config, target: &str, json: bool) -> Result<()>
 async fn show_status(config: &Config, target: Option<&str>, json: bool, details: bool) -> Result<()> {
     if let Some(target) = target { ensure!(config.nodes.contains_key(target), "unknown target: {target}"); }
     let routes = service::probe_routes(config, target).await;
+    debug_log!("probed {} routes", routes.len());
     let all_down = routes.iter().all(|r| r.state != "UP");
     let configured_routes: Vec<_> = config.effective_routes().into_iter()
         .filter(|route| target.is_none_or(|t| route.target == t)).collect();

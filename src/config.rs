@@ -109,14 +109,17 @@ pub struct Route {
 
 impl Config {
     pub fn load(path: &Path) -> Result<Self> {
+        crate::debug_log!("config: reading {}", path.display());
         let mut seen = BTreeSet::new();
         let mut config = Self::read_recursive(path, &mut seen)?;
+        crate::debug_log!("config: validating {} nodes and {} explicit routes", config.nodes.len(), config.routes.len());
         config.validate()?;
         config.routes.sort_by_key(|r| (r.priority, r.name.clone()));
         Ok(config)
     }
 
     fn read_recursive(path: &Path, seen: &mut BTreeSet<PathBuf>) -> Result<Self> {
+        crate::debug_log!("config: opening {}", path.display());
         let canonical = path
             .canonicalize()
             .with_context(|| format!("cannot open config {}", path.display()))?;
@@ -142,6 +145,7 @@ impl Config {
         })?;
         let includes = std::mem::take(&mut config.include);
         for include in includes {
+            crate::debug_log!("config: processing include {include}");
             let child = Self::read_recursive(&canonical.parent().unwrap().join(include), seen)?;
             for (id, node) in child.nodes {
                 ensure!(
