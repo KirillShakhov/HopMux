@@ -18,9 +18,12 @@ use tokio::{io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt}, sync::Mutex};
 use uuid::Uuid;
 
 const MAX_ROUTE_ATTEMPTS: u32 = 3;
+const ATOM_SIZE: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Journal {
+    #[serde(default)]
+    pub version: u8,
     pub id: Uuid,
     pub direction: Direction,
     pub target: String,
@@ -31,6 +34,8 @@ pub struct Journal {
     pub source_mtime: Option<u64>,
     pub sha256: String,
     pub chunk_size: usize,
+    #[serde(default)]
+    pub batch_size: usize,
     pub complete: Vec<bool>,
     pub published: bool,
     #[serde(default)]
@@ -151,16 +156,18 @@ fn retry_route(error: &anyhow::Error, attempts: u32) -> bool {
     !transport::is_permanent(error) && attempts < MAX_ROUTE_ATTEMPTS
 }
 
-async fn note_chunk(
+async fn note_batch(
     shared: &Arc<Mutex<Journal>>,
     sftp: &SftpSession,
     route: &str,
-    index: usize,
+    indices: &[usize],
     bytes: usize,
     elapsed: Duration,
 ) -> Result<()> {
     let mut journal = shared.lock().await;
-    journal.complete[index] = true;
+    for &index in indices {
+        journal.complete[index] = true;
+    }
     journal.updated_at_unix_ms = now_unix_ms();
     journal.last_error = None;
     let stats = journal.route_stats.entry(route.to_owned()).or_default();
@@ -172,7 +179,7 @@ async fn note_chunk(
             .map_or(sample_bps, |old| old * 0.7 + sample_bps * 0.3),
     );
     stats.last_at_unix_ms = now_unix_ms();
-    crate::debug_log!("transfer {}: chunk {} offset={} bytes={} route={} elapsed={} ms verified", journal.id, index, index as u64 * journal.chunk_size as u64, bytes, route, elapsed.as_millis());
+    crate::debug_log!("transfer {}: atoms {}..={} offset={} bytes={} route={} elapsed={} ms verified", journal.id, indices[0], indices[indices.len() - 1], indices[0] as u64 * journal.chunk_size as u64, bytes, route, elapsed.as_millis());
     save(sftp, &journal).await?;
     crate::debug::write_stderr(format_args!(
         "{}: {}/{} chunks via {}",
@@ -182,6 +189,17 @@ async fn note_chunk(
         route
     ));
     Ok(())
+}
+
+fn claim_group(queue: &mut VecDeque<usize>, max_atoms: usize) -> Vec<usize> {
+    let Some(first) = queue.pop_front() else { return Vec::new() };
+    let mut group = vec![first];
+    while group.len() < max_atoms.max(1)
+        && queue.front().is_some_and(|&next| next == group[group.len() - 1] + 1)
+    {
+        group.push(queue.pop_front().expect("front was checked"));
+    }
+    group
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -350,11 +368,13 @@ pub async fn put(config: &Config, target: &str, source: &Path, destination: &str
     let (size, sha256, source_mtime) = local_hash(source).await?;
     let id = Uuid::new_v4();
     let temporary = format!("{destination}.mssh-{id}.part");
-    let chunks = size.div_ceil(config.settings.chunk_size as u64) as usize;
+    let atom_size = ATOM_SIZE.min(config.settings.chunk_size);
+    let chunks = size.div_ceil(atom_size as u64) as usize;
     crate::debug_log!("upload {id}: source size={size} bytes, chunks={chunks}, SHA-256 {sha256}");
     let connection = connect_any(config, target).await?;
     let sftp = sftp(&connection).await?;
     let mut journal = Journal {
+        version: 2,
         id,
         direction: Direction::Put,
         target: target.into(),
@@ -364,7 +384,8 @@ pub async fn put(config: &Config, target: &str, source: &Path, destination: &str
         size,
         source_mtime,
         sha256,
-        chunk_size: config.settings.chunk_size,
+        chunk_size: atom_size,
+        batch_size: config.settings.chunk_size,
         complete: vec![false; chunks],
         published: false,
         route_stats: BTreeMap::new(),
@@ -515,14 +536,18 @@ async fn put_worker(
     let sftp = sftp(&connection).await?;
     note_session(&shared, &route.name, connect_started.elapsed(), &sftp).await?;
     let snapshot = shared.lock().await.clone();
+    let max_atoms = if snapshot.version >= 2 {
+        snapshot.batch_size.max(snapshot.chunk_size).div_ceil(snapshot.chunk_size)
+    } else { 1 };
     let mut local = tokio::fs::File::open(&snapshot.source).await?;
     loop {
-        let Some(index) = queue.lock().await.pop_front() else {
+        let group = claim_group(&mut *queue.lock().await, max_atoms);
+        if group.is_empty() {
             break;
-        };
+        }
         let chunk_started = Instant::now();
-        let offset = index as u64 * snapshot.chunk_size as u64;
-        let length = (snapshot.size - offset).min(snapshot.chunk_size as u64) as usize;
+        let offset = group[0] as u64 * snapshot.chunk_size as u64;
+        let length = (snapshot.size - offset).min(group.len() as u64 * snapshot.chunk_size as u64) as usize;
         let mut buffer = vec![0u8; length];
         local.seek(SeekFrom::Start(offset)).await?;
         local.read_exact(&mut buffer).await?;
@@ -539,9 +564,9 @@ async fn put_worker(
         check.close().await?;
         ensure!(
             Sha256::digest(&buffer) == Sha256::digest(&readback),
-            "remote chunk {index} differs after write"
+            "remote batch starting at atom {} differs after write", group[0]
         );
-        note_chunk(&shared, &sftp, &route.name, index, length, chunk_started.elapsed()).await?;
+        note_batch(&shared, &sftp, &route.name, &group, length, chunk_started.elapsed()).await?;
     }
     Ok(())
 }
@@ -601,6 +626,7 @@ pub async fn get(config: &Config, target: &str, source: &str, destination: &Path
     remote.close().await?;
     crate::debug_log!("download: source size={size} bytes, SHA-256 {}", hex::encode(hash.clone().finalize()));
     let id = Uuid::new_v4();
+    let atom_size = ATOM_SIZE.min(config.settings.chunk_size);
     let temporary = format!("{}.mssh-{id}.part", destination.display());
     let mut options = fs::OpenOptions::new();
     options.write(true).create_new(true);
@@ -612,6 +638,7 @@ pub async fn get(config: &Config, target: &str, source: &str, destination: &Path
     options.open(&temporary)?;
     crate::debug_log!("download {id}: created local part {temporary}");
     let mut journal = Journal {
+        version: 2,
         id,
         direction: Direction::Get,
         target: target.into(),
@@ -621,8 +648,9 @@ pub async fn get(config: &Config, target: &str, source: &str, destination: &Path
         size,
         source_mtime,
         sha256: hex::encode(hash.finalize()),
-        chunk_size: config.settings.chunk_size,
-        complete: vec![false; size.div_ceil(config.settings.chunk_size as u64) as usize],
+        chunk_size: atom_size,
+        batch_size: config.settings.chunk_size,
+        complete: vec![false; size.div_ceil(atom_size as u64) as usize],
         published: false,
         route_stats: BTreeMap::new(),
         last_error: None,
@@ -739,6 +767,9 @@ async fn get_worker(
     let sftp = sftp(&connection).await?;
     note_session(&shared, &route.name, connect_started.elapsed(), &sftp).await?;
     let snapshot = shared.lock().await.clone();
+    let max_atoms = if snapshot.version >= 2 {
+        snapshot.batch_size.max(snapshot.chunk_size).div_ceil(snapshot.chunk_size)
+    } else { 1 };
     let metadata = sftp.metadata(&snapshot.source).await?;
     let mtime = metadata
         .modified()
@@ -755,19 +786,20 @@ async fn get_worker(
         .open(&snapshot.temporary)
         .await?;
     loop {
-        let Some(index) = queue.lock().await.pop_front() else {
+        let group = claim_group(&mut *queue.lock().await, max_atoms);
+        if group.is_empty() {
             break;
-        };
+        }
         let chunk_started = Instant::now();
-        let offset = index as u64 * snapshot.chunk_size as u64;
-        let length = (snapshot.size - offset).min(snapshot.chunk_size as u64) as usize;
+        let offset = group[0] as u64 * snapshot.chunk_size as u64;
+        let length = (snapshot.size - offset).min(group.len() as u64 * snapshot.chunk_size as u64) as usize;
         remote.seek(SeekFrom::Start(offset)).await?;
         let mut buffer = vec![0u8; length];
         remote.read_exact(&mut buffer).await?;
         local.seek(SeekFrom::Start(offset)).await?;
         local.write_all(&buffer).await?;
         local.sync_data().await?;
-        note_chunk(&shared, &sftp, &route.name, index, length, chunk_started.elapsed()).await?;
+        note_batch(&shared, &sftp, &route.name, &group, length, chunk_started.elapsed()).await?;
     }
     remote.close().await?;
     Ok(())
@@ -776,6 +808,15 @@ async fn get_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn groups_only_adjacent_pending_atoms() {
+        let mut pending = VecDeque::from(vec![0, 1, 4, 5, 6]);
+        assert_eq!(claim_group(&mut pending, 4), [0, 1]);
+        assert_eq!(claim_group(&mut pending, 2), [4, 5]);
+        assert_eq!(claim_group(&mut pending, 2), [6]);
+        assert!(claim_group(&mut pending, 2).is_empty());
+    }
 
     #[cfg(unix)]
     #[test]
@@ -787,6 +828,7 @@ mod tests {
             "source_mtime": null, "sha256": "", "chunk_size": 65536,
             "complete": [false], "published": false
         })).unwrap();
+        assert_eq!(journal.version, 0);
         journal.worker_host = worker_host();
         journal.worker_pid = std::process::id();
         journal.updated_at_unix_ms = now_unix_ms();
