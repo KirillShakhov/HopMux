@@ -246,6 +246,21 @@ async fn note_failed_batch(shared: &Arc<Mutex<Journal>>, route: &str, selected_s
     }
 }
 
+async fn note_failed_connection(shared: &Arc<Mutex<Journal>>, route: &str, started: Instant) {
+    let mut journal = shared.lock().await;
+    if journal.adaptive {
+        let selected_size = route_batch_size(&journal, route);
+        let min = journal.min_batch_size.max(journal.chunk_size);
+        let max = journal.max_batch_size.max(min);
+        let stats = journal.route_stats.entry(route.to_owned()).or_default();
+        if !stats.fixed_batch_size {
+            observe_batch(stats, selected_size, 0, started.elapsed(), min, max);
+            crate::debug_log!("transfer {}: route {} connection failed after {} ms; next batch size {} bytes",
+                journal.id, route, started.elapsed().as_millis(), route_batch_size(&journal, route));
+        }
+    }
+}
+
 fn retry_route(error: &anyhow::Error, attempts: u32) -> bool {
     !transport::is_permanent(error) && attempts < MAX_ROUTE_ATTEMPTS
 }
@@ -659,8 +674,14 @@ async fn put_worker(
     queue: Arc<Mutex<VecDeque<usize>>>,
 ) -> Result<()> {
     let connect_started = Instant::now();
-    let connection = transport::connect(&config, &route).await?;
-    let sftp = sftp(&connection).await?;
+    let connection = match transport::connect(&config, &route).await {
+        Ok(connection) => connection,
+        Err(error) => { note_failed_connection(&shared, &route.name, connect_started).await; return Err(error); }
+    };
+    let sftp = match sftp(&connection).await {
+        Ok(sftp) => sftp,
+        Err(error) => { note_failed_connection(&shared, &route.name, connect_started).await; return Err(error); }
+    };
     note_session(&shared, &route.name, connect_started.elapsed(), &sftp).await?;
     let snapshot = shared.lock().await.clone();
     let mut local = tokio::fs::File::open(&snapshot.source).await?;
@@ -904,8 +925,14 @@ async fn get_worker(
     queue: Arc<Mutex<VecDeque<usize>>>,
 ) -> Result<()> {
     let connect_started = Instant::now();
-    let connection = transport::connect(&config, &route).await?;
-    let sftp = sftp(&connection).await?;
+    let connection = match transport::connect(&config, &route).await {
+        Ok(connection) => connection,
+        Err(error) => { note_failed_connection(&shared, &route.name, connect_started).await; return Err(error); }
+    };
+    let sftp = match sftp(&connection).await {
+        Ok(sftp) => sftp,
+        Err(error) => { note_failed_connection(&shared, &route.name, connect_started).await; return Err(error); }
+    };
     note_session(&shared, &route.name, connect_started.elapsed(), &sftp).await?;
     let snapshot = shared.lock().await.clone();
     let metadata = sftp.metadata(&snapshot.source).await?;
