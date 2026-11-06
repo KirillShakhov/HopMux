@@ -1,5 +1,6 @@
 use crate::{
     config::{Config, Route},
+    output,
     transport,
 };
 use anyhow::{Context, Result, ensure};
@@ -207,7 +208,7 @@ fn now_unix_ms() -> u128 {
         .as_millis()
 }
 
-async fn note_session(shared: &Arc<Mutex<Journal>>, route: &str, connect: Duration) {
+async fn note_session(shared: &Arc<Mutex<Journal>>, route: &str, route_display: &str, connect: Duration) {
     let mut journal = shared.lock().await;
     journal.updated_at_unix_ms = now_unix_ms();
     let stats = journal.route_stats.entry(route.to_owned()).or_default();
@@ -217,7 +218,7 @@ async fn note_session(shared: &Arc<Mutex<Journal>>, route: &str, connect: Durati
     stats.sessions = stats.sessions.saturating_add(1);
     stats.connect_ms = stats.connect_ms.saturating_add(connect.as_millis());
     stats.pending_connect_ms = connect.as_millis();
-    crate::debug_log!("transfer {}: route {} session opened", journal.id, route);
+    crate::debug_log!("transfer {}: route {} session opened", journal.id, route_display);
 }
 
 async fn note_worker_finished(
@@ -237,7 +238,7 @@ async fn note_worker_finished(
         if failed {
             stats.failed_session_ms = stats.failed_session_ms.saturating_add(elapsed.as_millis());
         }
-        crate::debug_log!("transfer {}: route {} session ended after {} ms, failed={failed}", journal.id, route, elapsed.as_millis());
+        crate::debug_log!("transfer {}: route {} session ended after {} ms, failed={failed}", journal.id, output::route_label_by_name(config, &journal.target, route), elapsed.as_millis());
     }
     save_shared(shared, save_lock, sftp, Some(config), true).await
 }
@@ -249,12 +250,12 @@ async fn note_error(shared: &Arc<Mutex<Journal>>, save_lock: &Arc<Mutex<()>>, ro
         let stats = journal.route_stats.entry(route.to_owned()).or_default();
         stats.errors = stats.errors.saturating_add(1);
         journal.last_error = Some(format!("{error:#}"));
-        crate::debug_log!("transfer {}: route {} error: {error:#}", journal.id, route);
+        crate::debug_log!("transfer {}: route {} error: {error:#}", journal.id, output::route_label_by_name(config, &journal.target, route));
     }
     save_shared(shared, save_lock, sftp, Some(config), true).await
 }
 
-async fn note_failed_batch(shared: &Arc<Mutex<Journal>>, route: &str, selected_size: usize, started: Instant) {
+async fn note_failed_batch(shared: &Arc<Mutex<Journal>>, route: &str, route_display: &str, selected_size: usize, started: Instant) {
     let mut journal = shared.lock().await;
     if journal.adaptive {
         let min = journal.min_batch_size.max(journal.chunk_size);
@@ -263,12 +264,12 @@ async fn note_failed_batch(shared: &Arc<Mutex<Journal>>, route: &str, selected_s
         let stats = journal.route_stats.entry(route.to_owned()).or_default();
         if !stats.fixed_batch_size {
             observe_batch(stats, selected_size, 0, started.elapsed(), min, max, timeout_secs);
-            crate::debug_log!("transfer {}: route {} batch failed; next size {} bytes", journal.id, route, route_batch_size(&journal, route));
+            crate::debug_log!("transfer {}: route {} batch failed; next size {} bytes", journal.id, route_display, route_batch_size(&journal, route));
         }
     }
 }
 
-async fn note_failed_connection(shared: &Arc<Mutex<Journal>>, route: &str, started: Instant) {
+async fn note_failed_connection(shared: &Arc<Mutex<Journal>>, route: &str, route_display: &str, started: Instant) {
     let mut journal = shared.lock().await;
     if journal.adaptive {
         let selected_size = route_batch_size(&journal, route);
@@ -279,7 +280,7 @@ async fn note_failed_connection(shared: &Arc<Mutex<Journal>>, route: &str, start
         if !stats.fixed_batch_size {
             observe_batch(stats, selected_size, 0, started.elapsed(), min, max, timeout_secs);
             crate::debug_log!("transfer {}: route {} connection failed after {} ms; next batch size {} bytes",
-                journal.id, route, started.elapsed().as_millis(), route_batch_size(&journal, route));
+                journal.id, route_display, started.elapsed().as_millis(), route_batch_size(&journal, route));
         }
     }
 }
@@ -293,6 +294,7 @@ async fn note_batch(
     save_lock: &Arc<Mutex<()>>,
     sftp: &SftpSession,
     route: &str,
+    route_display: &str,
     indices: &[usize],
     bytes: usize,
     selected_size: usize,
@@ -314,7 +316,7 @@ async fn note_batch(
             .map_or(sample_bps, |old| old * 0.7 + sample_bps * 0.3),
     );
     stats.last_at_unix_ms = now_unix_ms();
-    crate::debug_log!("transfer {}: atoms {}..={} offset={} bytes={} route={} elapsed={} ms committed", journal.id, indices[0], indices[indices.len() - 1], indices[0] as u64 * journal.chunk_size as u64, bytes, route, elapsed.as_millis());
+    crate::debug_log!("transfer {}: atoms {}..={} offset={} bytes={} route={} elapsed={} ms committed", journal.id, indices[0], indices[indices.len() - 1], indices[0] as u64 * journal.chunk_size as u64, bytes, route_display, elapsed.as_millis());
     journal.uncheckpointed_bytes = journal.uncheckpointed_bytes.saturating_add(bytes as u64);
     let checkpoint = journal.uncheckpointed_bytes >= CHECKPOINT_BYTES || journal.checkpoint_at.elapsed() >= CHECKPOINT_INTERVAL;
     if journal.adaptive && bytes >= selected_size {
@@ -324,7 +326,7 @@ async fn note_batch(
         let stats = journal.route_stats.entry(route.to_owned()).or_default();
         if !stats.fixed_batch_size {
             observe_batch(stats, selected_size, bytes, started.elapsed(), min, max, timeout_secs);
-            crate::debug_log!("transfer {}: route {} next batch size {} bytes", journal.id, route, route_batch_size(&journal, route));
+            crate::debug_log!("transfer {}: route {} next batch size {} bytes", journal.id, route_display, route_batch_size(&journal, route));
         }
     }
     crate::debug::write_stderr(format_args!(
@@ -332,7 +334,7 @@ async fn note_batch(
         journal.id,
         journal.complete.iter().filter(|&&done| done).count(),
         journal.complete.len(),
-        route
+        route_display
     ));
     drop(journal);
     if checkpoint { save_shared(shared, save_lock, sftp, None, false).await?; }
@@ -514,10 +516,10 @@ pub(crate) async fn sftp(connection: &transport::Connection) -> Result<SftpSessi
 pub(crate) async fn connect_any(config: &Config, target: &str) -> Result<transport::Connection> {
     let mut last_error = None;
     for route in config.routes_for(target) {
-        crate::debug_log!("SFTP: trying route {} to {target}", route.name);
+        crate::debug_log!("SFTP: trying route {}", output::route_label(&route));
         match transport::connect(config, &route).await {
-            Ok(connection) => { crate::debug_log!("SFTP: route {} connected", route.name); return Ok(connection) },
-            Err(error) => { crate::debug_log!("SFTP: route {} failed: {error:#}", route.name); last_error = Some(error) },
+            Ok(connection) => { crate::debug_log!("SFTP: route {} connected", output::route_label(&route)); return Ok(connection) },
+            Err(error) => { crate::debug_log!("SFTP: route {} failed: {error:#}", output::route_label(&route)); last_error = Some(error) },
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no route to target {target}")))
@@ -624,7 +626,7 @@ async fn local_source(path: &Path, verify: bool) -> Result<(u64, String, Option<
 }
 
 pub async fn put(config: &Config, target: &str, source: &Path, destination: &str) -> Result<Uuid> {
-    crate::debug_log!("upload: {} -> {}:{}", source.display(), target, destination);
+    crate::debug_log!("upload: local:{} -> {}:{}", source.display(), target, destination);
     let routes = config.routes_for(target);
     ensure!(!routes.is_empty(), "no route to target {target}");
     ensure!(
@@ -709,7 +711,7 @@ async fn process_put(
         .take(config.settings.max_parallel_routes)
         .collect();
     ensure!(!routes.is_empty(), "no route to target {}", journal.target);
-    crate::debug_log!("upload {}: using routes {}", journal.id, routes.iter().map(|route| route.name.as_str()).collect::<Vec<_>>().join(", "));
+    crate::debug_log!("upload {}: using routes {}", journal.id, routes.iter().map(output::route_label).collect::<Vec<_>>().join("; "));
     let shared = Arc::new(Mutex::new(journal.clone()));
     let save_lock = Arc::new(Mutex::new(()));
     let config = Arc::new(config.clone());
@@ -750,7 +752,7 @@ async fn process_put(
             let (name, elapsed, outcome) = result?;
             note_worker_finished(&shared, &save_lock, &name, elapsed, outcome.is_err(), control_sftp, &config).await?;
             if let Err(error) = outcome {
-                crate::debug::write_stderr(format_args!("route {name}: {error:#}"));
+                crate::debug::write_stderr(format_args!("route {}: {error:#}", output::route_label_by_name(&config, &journal.target, &name)));
                 note_error(&shared, &save_lock, &name, &error, control_sftp, &config).await?;
                 let attempts = failures.entry(name.clone()).or_default();
                 *attempts += 1;
@@ -805,16 +807,17 @@ async fn put_worker(
     save_lock: Arc<Mutex<()>>,
     queue: Arc<Mutex<VecDeque<usize>>>,
 ) -> Result<()> {
+    let route_display = output::route_label(&route);
     let connect_started = Instant::now();
     let connection = match transport::connect(&config, &route).await {
         Ok(connection) => connection,
-        Err(error) => { note_failed_connection(&shared, &route.name, connect_started).await; return Err(error); }
+        Err(error) => { note_failed_connection(&shared, &route.name, &route_display, connect_started).await; return Err(error); }
     };
     let sftp = match sftp(&connection).await {
         Ok(sftp) => sftp,
-        Err(error) => { note_failed_connection(&shared, &route.name, connect_started).await; return Err(error); }
+        Err(error) => { note_failed_connection(&shared, &route.name, &route_display, connect_started).await; return Err(error); }
     };
-    note_session(&shared, &route.name, connect_started.elapsed()).await;
+    note_session(&shared, &route.name, &route_display, connect_started.elapsed()).await;
     let snapshot = shared.lock().await.clone();
     let mut local = tokio::fs::File::open(&snapshot.source).await?;
     loop {
@@ -840,19 +843,19 @@ async fn put_worker(
         let result = tokio::time::timeout(Duration::from_secs(snapshot.chunk_timeout_secs.unwrap_or(120)), batch_io).await;
         match result {
             Ok(Ok(())) => {},
-            Ok(Err(error)) => { note_failed_batch(&shared, &route.name, selected_size, chunk_started).await; return Err(error); },
+            Ok(Err(error)) => { note_failed_batch(&shared, &route.name, &route_display, selected_size, chunk_started).await; return Err(error); },
             Err(_) => {
-                note_failed_batch(&shared, &route.name, selected_size, chunk_started).await;
+                note_failed_batch(&shared, &route.name, &route_display, selected_size, chunk_started).await;
                 anyhow::bail!("batch starting at atom {} exceeded {} second timeout", group[0], snapshot.chunk_timeout_secs.unwrap_or(120));
             }
         }
-        note_batch(&shared, &save_lock, &sftp, &route.name, &group, length, selected_size, chunk_started).await?;
+        note_batch(&shared, &save_lock, &sftp, &route.name, &route_display, &group, length, selected_size, chunk_started).await?;
     }
     Ok(())
 }
 
 pub async fn continue_transfer(config: &Config, journal: &Journal) -> Result<()> {
-    crate::debug_log!("transfer {}: continuing {:?} to {}", journal.id, journal.direction, journal.destination);
+    crate::debug_log!("transfer {}: continuing {}", journal.id, output::transfer_chain(journal));
     let mut journal = journal.clone();
     ensure!(!journal.published, "transfer already published");
     ensure!(!is_active(&journal), "transfer is still active");
@@ -872,7 +875,7 @@ pub async fn continue_transfer(config: &Config, journal: &Journal) -> Result<()>
 }
 
 pub async fn get(config: &Config, target: &str, source: &str, destination: &Path) -> Result<Uuid> {
-    crate::debug_log!("download: {}:{} -> {}", target, source, destination.display());
+    crate::debug_log!("download: {}:{} -> local:{}", target, source, destination.display());
     let routes = config.routes_for(target);
     ensure!(!routes.is_empty(), "no route to target {target}");
     ensure!(
@@ -956,7 +959,7 @@ async fn process_get(config: &Config, journal: &mut Journal, control_sftp: &Sftp
         .take(config.settings.max_parallel_routes)
         .collect();
     ensure!(!routes.is_empty(), "no route to target {}", journal.target);
-    crate::debug_log!("download {}: using routes {}", journal.id, routes.iter().map(|route| route.name.as_str()).collect::<Vec<_>>().join(", "));
+    crate::debug_log!("download {}: using routes {}", journal.id, routes.iter().map(output::route_label).collect::<Vec<_>>().join("; "));
     ensure!(
         !Path::new(&journal.destination).exists(),
         "local destination already exists"
@@ -1005,7 +1008,7 @@ async fn process_get(config: &Config, journal: &mut Journal, control_sftp: &Sftp
             let (name, elapsed, outcome) = result?;
             note_worker_finished(&shared, &save_lock, &name, elapsed, outcome.is_err(), control_sftp, &config).await?;
             if let Err(error) = outcome {
-                crate::debug::write_stderr(format_args!("route {name}: {error:#}"));
+                crate::debug::write_stderr(format_args!("route {}: {error:#}", output::route_label_by_name(&config, &journal.target, &name)));
                 note_error(&shared, &save_lock, &name, &error, control_sftp, &config).await?;
                 let attempts = failures.entry(name.clone()).or_default();
                 *attempts += 1;
@@ -1055,16 +1058,17 @@ async fn get_worker(
     save_lock: Arc<Mutex<()>>,
     queue: Arc<Mutex<VecDeque<usize>>>,
 ) -> Result<()> {
+    let route_display = output::route_label(&route);
     let connect_started = Instant::now();
     let connection = match transport::connect(&config, &route).await {
         Ok(connection) => connection,
-        Err(error) => { note_failed_connection(&shared, &route.name, connect_started).await; return Err(error); }
+        Err(error) => { note_failed_connection(&shared, &route.name, &route_display, connect_started).await; return Err(error); }
     };
     let sftp = match sftp(&connection).await {
         Ok(sftp) => sftp,
-        Err(error) => { note_failed_connection(&shared, &route.name, connect_started).await; return Err(error); }
+        Err(error) => { note_failed_connection(&shared, &route.name, &route_display, connect_started).await; return Err(error); }
     };
-    note_session(&shared, &route.name, connect_started.elapsed()).await;
+    note_session(&shared, &route.name, &route_display, connect_started.elapsed()).await;
     let snapshot = shared.lock().await.clone();
     let metadata = sftp.metadata(&snapshot.source).await?;
     let mtime = metadata
@@ -1103,13 +1107,13 @@ async fn get_worker(
         let result = tokio::time::timeout(Duration::from_secs(snapshot.chunk_timeout_secs.unwrap_or(120)), batch_io).await;
         match result {
             Ok(Ok(())) => {},
-            Ok(Err(error)) => { note_failed_batch(&shared, &route.name, selected_size, chunk_started).await; return Err(error); },
+            Ok(Err(error)) => { note_failed_batch(&shared, &route.name, &route_display, selected_size, chunk_started).await; return Err(error); },
             Err(_) => {
-                note_failed_batch(&shared, &route.name, selected_size, chunk_started).await;
+                note_failed_batch(&shared, &route.name, &route_display, selected_size, chunk_started).await;
                 anyhow::bail!("batch starting at atom {} exceeded {} second timeout", group[0], snapshot.chunk_timeout_secs.unwrap_or(120));
             }
         }
-        note_batch(&shared, &save_lock, &sftp, &route.name, &group, length, selected_size, chunk_started).await?;
+        note_batch(&shared, &save_lock, &sftp, &route.name, &route_display, &group, length, selected_size, chunk_started).await?;
     }
     remote.close().await?;
     Ok(())

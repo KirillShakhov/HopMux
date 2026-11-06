@@ -93,7 +93,7 @@ pub async fn put_directory(
     source: &Path,
     destination: &str,
 ) -> Result<()> {
-    crate::debug_log!("directory upload: {} -> {}:{}", source.display(), target, destination);
+    crate::debug_log!("directory upload: local:{} -> {}:{}", source.display(), target, destination);
     ensure!(source.is_dir(), "local source is not a directory");
     ensure!(
         destination.starts_with('/'),
@@ -118,7 +118,7 @@ pub async fn put_directory(
             let remote = remote_child(&remote_dir, name);
             let metadata = fs::symlink_metadata(&local)?;
             if metadata.file_type().is_symlink() {
-                crate::debug_log!("directory upload: symlink {} -> {remote}", local.display());
+                crate::debug_log!("directory upload: symlink local:{} -> {}:{remote}", local.display(), target);
                 #[cfg(unix)]
                 {
                     let link = fs::read_link(&local)?;
@@ -132,7 +132,7 @@ pub async fn put_directory(
                 sftp.create_dir(&remote).await?;
                 stack.push((local, remote));
             } else if metadata.is_file() {
-                crate::debug_log!("directory upload: file {} -> {remote}", local.display());
+                crate::debug_log!("directory upload: file local:{} -> {}:{remote}", local.display(), target);
                 transfer::put(config, target, &local, &remote).await?;
                 set_remote_metadata(&sftp, &remote, &metadata).await?;
             } else {
@@ -153,7 +153,7 @@ pub async fn get_directory(
     source: &str,
     destination: &Path,
 ) -> Result<()> {
-    crate::debug_log!("directory download: {}:{} -> {}", target, source, destination.display());
+    crate::debug_log!("directory download: {}:{} -> local:{}", target, source, destination.display());
     ensure!(
         source.starts_with('/'),
         "remote source must be an absolute path"
@@ -186,12 +186,12 @@ pub async fn get_directory(
                     stack.push((remote, local));
                 }
                 FileType::File => {
-                    crate::debug_log!("directory download: file {remote} -> {}", local.display());
+                    crate::debug_log!("directory download: file {}:{remote} -> local:{}", target, local.display());
                     transfer::get(config, target, &remote, &local).await?;
                     set_local_metadata(&local, &attrs)?;
                 }
                 FileType::Symlink => {
-                    crate::debug_log!("directory download: symlink {remote} -> {}", local.display());
+                    crate::debug_log!("directory download: symlink {}:{remote} -> local:{}", target, local.display());
                     #[cfg(unix)]
                     {
                         let link = sftp.read_link(&remote).await?;
