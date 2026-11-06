@@ -407,6 +407,16 @@ mod tests {
     }
 
     #[test]
+    fn path_order_controls_priority_even_when_direct_host_order_differs() {
+        let mut config = graph_sample();
+        config.paths.swap(0, 2);
+        config.validate().unwrap();
+        assert_eq!(config.routes_for("target")[0].hops, ["edge_b", "hub", "target"]);
+        assert_eq!(config.routes_for("target")[1].hops,
+            ["edge_a", "relay", "hub", "target"]);
+    }
+
+    #[test]
     fn long_path_exposes_every_prefix() {
         let mut config = graph_sample();
         config.paths = vec![vec!["edge_a".into(), "relay".into(), "hub".into(), "target".into()]];
