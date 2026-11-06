@@ -1,6 +1,7 @@
 mod config;
 mod debug;
 mod directory;
+mod forward;
 mod output;
 mod routing;
 mod service;
@@ -126,6 +127,7 @@ async fn run() -> Result<()> {
         eprintln!("warning: SSH host keys are not verified for nodes: {}", unpinned.join(", "));
     }
     match cli.args.as_slice() {
+        [cmd] if cmd == "serve" => forward::serve(&config).await?,
         [cmd, check] if cmd == "config" && check == "check" => {
             debug_log!("validating configuration");
             println!("config OK: {} nodes, {} routes", config.nodes.len(), config.effective_routes().len());
@@ -169,7 +171,7 @@ async fn run() -> Result<()> {
                 println!("transfer complete: {source} -> {destination}");
             }
         }
-        _ => bail!("usage: mssh TARGET | mssh SOURCE DESTINATION | mssh status [TARGET] | mssh transfers TARGET | mssh config check"),
+        _ => bail!("usage: mssh TARGET | mssh SOURCE DESTINATION | mssh status [TARGET] | mssh transfers TARGET | mssh config check | mssh serve"),
     }
     Ok(())
 }
