@@ -1,6 +1,7 @@
 mod config;
 mod debug;
 mod directory;
+mod output;
 mod service;
 mod terminal;
 mod transfer;
@@ -74,7 +75,10 @@ async fn run() -> Result<()> {
     }
     config.route_filter = cli.routes.clone();
     config.verify = cli.verify;
-    debug_log!("selected routes: {}", if cli.routes.is_empty() { "all".to_owned() } else { cli.routes.join(", ") });
+    debug_log!("selected routes: {}", if cli.routes.is_empty() { "all".to_owned() } else {
+        config.effective_routes().iter().filter(|route| cli.routes.contains(&route.name))
+            .map(output::route_label).collect::<Vec<_>>().join("; ")
+    });
     if let Some(chunk_size) = &cli.chunk_size {
         if chunk_size.eq_ignore_ascii_case("auto") {
             config.auto_chunk = true;
@@ -134,11 +138,11 @@ async fn run() -> Result<()> {
             if cli.background {
                 debug_log!("starting background copy worker");
                 spawn_worker(&cli, &path, action)?;
-                println!("transfer started in background");
+                println!("transfer started in background: {source} -> {destination}");
             } else {
                 debug_log!("running copy in foreground");
                 service::execute_copy(&config, plan, action).await?;
-                println!("transfer complete");
+                println!("transfer complete: {source} -> {destination}");
             }
         }
         _ => bail!("usage: mssh TARGET | mssh SOURCE DESTINATION | mssh status [TARGET] | mssh transfers TARGET | mssh config check"),
@@ -153,7 +157,7 @@ fn choose_action(cli: &Cli, plan: &service::CopyPlan) -> Result<PartialAction> {
     if cli.restart || cli.worker_action.as_deref() == Some("restart") { debug_log!("restarting partial transfer"); return Ok(PartialAction::Restart); }
     ensure!(cli.worker_action.is_none(), "partial transfer appeared after background worker started; choose --continue-partial or --restart");
     ensure!(!cli.background || atty_stdin(), "partial transfer exists; use --continue-partial or --restart with -d");
-    eprint!("Partial transfer found. [c]ontinue or [r]estart? ");
+    eprint!("Partial transfer found: {}. [c]ontinue or [r]estart? ", output::transfer_chain(plan.partial.as_ref().unwrap()));
     io::stderr().flush()?;
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
@@ -222,9 +226,9 @@ async fn show_transfers(config: &Config, target: &str, json: bool) -> Result<()>
     else {
         for j in journals {
             let done = j.complete.iter().filter(|&&x| x).count();
-            println!("{} {:?} {} -> {} {}/{} chunks{}{}", j.id, j.direction, j.source, j.destination, done, j.complete.len(), if j.published { " [done]" } else { " [partial]" }, if j.verify { " [SHA-256]" } else { "" });
+            println!("{} {} {}/{} chunks{}{}", j.id, output::transfer_chain(&j), done, j.complete.len(), if j.published { " [done]" } else { " [partial]" }, if j.verify { " [SHA-256]" } else { "" });
             if let Some(error) = &j.last_error { println!("  error: {error}"); }
-            for (route, stats) in j.route_stats { println!("  {route}: {} bytes, batch {} bytes, connect {} ms, session {} ms, failed {} ms, errors {}, reconnects {}", stats.bytes, if stats.chosen_batch_size > 0 { stats.chosen_batch_size } else { j.batch_size.max(j.chunk_size) }, stats.connect_ms, stats.session_ms, stats.failed_session_ms, stats.errors, stats.reconnects); }
+            for (route, stats) in j.route_stats { println!("  {}: {} bytes, batch {} bytes, connect {} ms, session {} ms, failed {} ms, errors {}, reconnects {}", output::route_label_by_name(config, target, &route), stats.bytes, if stats.chosen_batch_size > 0 { stats.chosen_batch_size } else { j.batch_size.max(j.chunk_size) }, stats.connect_ms, stats.session_ms, stats.failed_session_ms, stats.errors, stats.reconnects); }
         }
     }
     Ok(())
@@ -252,23 +256,26 @@ async fn show_status(config: &Config, target: Option<&str>, json: bool, details:
                 println!("auth {}: key={} password={} agent={} usable={}", node.node, node.key_available, node.password_available, node.agent_available, node.usable);
             }
             for route in &configured_routes {
-                if route.disabled { println!("{} -> {} [disabled]", route.name, route.target); }
+                if route.disabled { println!("{} [disabled]", output::route_label(route)); }
             }
         }
         for route in &routes {
-            println!("{} -> {}: {} connect={:?}ms rtt={:?}ms{}", route.route, route.target, route.state, route.connect_ms, route.rtt_ms, route.error.as_ref().map_or(String::new(), |e| format!(" {e}")));
+            println!("{}: {}: {} connect={:?}ms rtt={:?}ms{}", route.route, output::route_chain(&route.hops), route.state, route.connect_ms, route.rtt_ms, route.error.as_ref().map_or(String::new(), |e| format!(" {e}")));
             if details {
-                println!("  via {}", route.hops.join(" -> "));
-                for hop in &route.hop_timings { println!("  {hop:?}"); }
+                let mut previous = "local";
+                for hop in &route.hop_timings {
+                    println!("  {previous} -> {}: connect={}ms", hop.node, hop.connect_ms);
+                    previous = &hop.node;
+                }
             }
         }
         for (node, journals) in transfers {
             for j in journals {
                 let done = j.complete.iter().filter(|&&x| x).count();
-                println!("transfer {} on {}: {:?} {}/{} chunks{}{}", j.id, node, j.direction, done, j.complete.len(), if j.published { " [done]" } else { " [partial]" }, if j.verify { " [SHA-256]" } else { "" });
+                println!("transfer {}: {} {}/{} chunks{}{}", j.id, output::transfer_chain(&j), done, j.complete.len(), if j.published { " [done]" } else { " [partial]" }, if j.verify { " [SHA-256]" } else { "" });
                 if let Some(error) = &j.last_error { println!("  error: {error}"); }
                 if details {
-                    for (route, stats) in j.route_stats { println!("  {route}: {} bytes, batch {} bytes, connect {} ms, session {} ms, failed {} ms, errors {}, reconnects {}", stats.bytes, if stats.chosen_batch_size > 0 { stats.chosen_batch_size } else { j.batch_size.max(j.chunk_size) }, stats.connect_ms, stats.session_ms, stats.failed_session_ms, stats.errors, stats.reconnects); }
+                    for (route, stats) in j.route_stats { println!("  {}: {} bytes, batch {} bytes, connect {} ms, session {} ms, failed {} ms, errors {}, reconnects {}", output::route_label_by_name(config, &node, &route), stats.bytes, if stats.chosen_batch_size > 0 { stats.chosen_batch_size } else { j.batch_size.max(j.chunk_size) }, stats.connect_ms, stats.session_ms, stats.failed_session_ms, stats.errors, stats.reconnects); }
                 }
             }
         }
