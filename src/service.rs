@@ -91,7 +91,7 @@ pub async fn probe_routes(config: &Config, target: Option<&str>) -> Vec<RouteSta
                             Some("SSH ping timed out".to_owned()),
                         ),
                     };
-                    crate::debug_log!("status: route {} state {}, RTT {:?} ms", output::route_label(&route), state, rtt_ms);
+                    crate::debug_log!("status: route {} state {}, RTT {}", output::route_label(&route), state, output::optional_ms(rtt_ms));
                     RouteStatus {
                         route: route.name,
                         target: route.target,
