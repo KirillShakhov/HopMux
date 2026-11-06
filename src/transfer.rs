@@ -611,11 +611,16 @@ pub async fn put(config: &Config, target: &str, source: &Path, destination: &str
         let _ = sftp.remove_file(&journal.temporary).await;
         return Err(error);
     }
-    process_put(config, &mut journal).await?;
+    process_put(config, &mut journal, &connection, &sftp).await?;
     Ok(id)
 }
 
-async fn process_put(config: &Config, journal: &mut Journal) -> Result<()> {
+async fn process_put(
+    config: &Config,
+    journal: &mut Journal,
+    control_connection: &transport::Connection,
+    control_sftp: &SftpSession,
+) -> Result<()> {
     crate::debug_log!("upload {}: processing {} pending chunks", journal.id, journal.complete.iter().filter(|&&done| !done).count());
     let source = Path::new(&journal.source);
     let (size, sha256, mtime) = local_hash(source).await?;
@@ -630,8 +635,6 @@ async fn process_put(config: &Config, journal: &mut Journal) -> Result<()> {
         .collect();
     ensure!(!routes.is_empty(), "no route to target {}", journal.target);
     crate::debug_log!("upload {}: using routes {}", journal.id, routes.iter().map(|route| route.name.as_str()).collect::<Vec<_>>().join(", "));
-    let control_connection = connect_any(config, &journal.target).await?;
-    let control_sftp = sftp(&control_connection).await?;
     let shared = Arc::new(Mutex::new(journal.clone()));
     let config = Arc::new(config.clone());
     let mut failures = BTreeMap::<String, u32>::new();
@@ -686,19 +689,17 @@ async fn process_put(config: &Config, journal: &mut Journal) -> Result<()> {
         }
     }
     *journal = shared.lock().await.clone();
-    let connection = connect_any(&config, &journal.target).await?;
-    let sftp = sftp(&connection).await?;
-    let digest = remote_hash(&connection, &sftp, &journal.temporary, journal.chunk_size).await?;
+    let digest = remote_hash(control_connection, control_sftp, &journal.temporary, journal.chunk_size).await?;
     ensure!(
         digest == journal.sha256,
         "remote SHA-256 differs; temporary file retained"
     );
     crate::debug_log!("upload {}: remote SHA-256 verified", journal.id);
     ensure!(
-        !sftp.try_exists(&journal.destination).await?,
+        !control_sftp.try_exists(&journal.destination).await?,
         "destination appeared during upload"
     );
-    let linked = sftp
+    let linked = control_sftp
         .hardlink(&journal.temporary, &journal.destination)
         .await?;
     ensure!(
@@ -708,9 +709,9 @@ async fn process_put(config: &Config, journal: &mut Journal) -> Result<()> {
     );
     journal.published = true;
     crate::debug_log!("upload {}: published {}", journal.id, journal.destination);
-    save(&sftp, journal).await?;
+    save(control_sftp, journal).await?;
     // The published name is safe now; cleanup failure is nonfatal.
-    let _ = sftp.remove_file(&journal.temporary).await;
+    let _ = control_sftp.remove_file(&journal.temporary).await;
     Ok(())
 }
 
@@ -788,8 +789,8 @@ pub async fn continue_transfer(config: &Config, journal: &Journal) -> Result<()>
     remove_stale_journal_writes(&sftp, &journal).await?;
     save(&sftp, &journal).await?;
     match journal.direction {
-        Direction::Put => process_put(config, &mut journal).await,
-        Direction::Get => process_get(config, &mut journal).await,
+        Direction::Put => process_put(config, &mut journal, &connection, &sftp).await,
+        Direction::Get => process_get(config, &mut journal, &sftp).await,
     }
 }
 
@@ -862,11 +863,11 @@ pub async fn get(config: &Config, target: &str, source: &str, destination: &Path
         let _ = fs::remove_file(&journal.temporary);
         return Err(error);
     }
-    process_get(config, &mut journal).await?;
+    process_get(config, &mut journal, &sftp).await?;
     Ok(id)
 }
 
-async fn process_get(config: &Config, journal: &mut Journal) -> Result<()> {
+async fn process_get(config: &Config, journal: &mut Journal, control_sftp: &SftpSession) -> Result<()> {
     crate::debug_log!("download {}: processing {} pending chunks", journal.id, journal.complete.iter().filter(|&&done| !done).count());
     let mut routes: Vec<Route> = config
         .routes_for(&journal.target)
@@ -883,8 +884,6 @@ async fn process_get(config: &Config, journal: &mut Journal) -> Result<()> {
         Path::new(&journal.temporary).exists(),
         "local temporary file is missing"
     );
-    let control_connection = connect_any(config, &journal.target).await?;
-    let control_sftp = sftp(&control_connection).await?;
     let shared = Arc::new(Mutex::new(journal.clone()));
     let config = Arc::new(config.clone());
     let mut failures = BTreeMap::<String, u32>::new();
