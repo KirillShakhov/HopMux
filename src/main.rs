@@ -2,6 +2,7 @@ mod config;
 mod debug;
 mod directory;
 mod output;
+mod routing;
 mod service;
 mod terminal;
 mod transfer;

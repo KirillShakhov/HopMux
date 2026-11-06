@@ -16,6 +16,10 @@ pub struct Config {
     #[serde(default)]
     pub nodes: BTreeMap<String, Node>,
     #[serde(default)]
+    pub direct_hosts: Vec<String>,
+    #[serde(default)]
+    pub paths: Vec<Vec<String>>,
+    #[serde(default)]
     pub routes: Vec<Route>,
     #[serde(skip)]
     pub route_filter: Vec<String>,
@@ -128,7 +132,7 @@ impl Config {
         crate::debug_log!("config: reading {}", path.display());
         let mut seen = BTreeSet::new();
         let mut config = Self::read_recursive(path, &mut seen)?;
-        crate::debug_log!("config: validating {} nodes and {} explicit routes", config.nodes.len(), config.routes.len());
+        crate::debug_log!("config: validating {} nodes, {} paths, {} direct hosts and {} legacy routes", config.nodes.len(), config.paths.len(), config.direct_hosts.len(), config.routes.len());
         config.validate()?;
         config.routes.sort_by_key(|r| (r.priority, r.name.clone()));
         Ok(config)
@@ -172,6 +176,8 @@ impl Config {
             for route in child.routes {
                 config.routes.push(route);
             }
+            config.direct_hosts.extend(child.direct_hosts);
+            config.paths.extend(child.paths);
         }
         Ok(config)
     }
@@ -233,6 +239,31 @@ impl Config {
                 );
             }
         }
+        if self.graph_mode() {
+            ensure!(self.routes.is_empty(), "use paths and direct_hosts without legacy [[routes]] entries");
+            ensure!(!self.direct_hosts.is_empty(), "direct_hosts must list at least one host reachable from the client");
+            let mut direct_seen = BTreeSet::new();
+            for host in &self.direct_hosts {
+                ensure!(self.nodes.contains_key(host), "direct_hosts: unknown node {host}");
+                ensure!(direct_seen.insert(host), "direct_hosts: duplicate node {host}");
+            }
+            for (index, path) in self.paths.iter().enumerate() {
+                ensure!(path.len() >= 2, "paths[{}] must contain at least two hosts", index + 1);
+                let mut visited = BTreeSet::new();
+                for host in path {
+                    ensure!(self.nodes.contains_key(host), "paths[{}]: unknown node {host}", index + 1);
+                    ensure!(visited.insert(host), "paths[{}]: repeated node {host}", index + 1);
+                }
+            }
+            let (routes, overflow) = crate::routing::discover(self);
+            ensure!(!overflow, "too many paths can be composed; simplify the network graph");
+            let reachable: BTreeSet<_> = routes.iter().map(|route| route.target.as_str()).collect();
+            for path in &self.paths {
+                ensure!(path.iter().all(|host| reachable.contains(host.as_str())),
+                    "configured path contains a host unreachable from direct_hosts: {}", path.join(" -> "));
+            }
+            return Ok(());
+        }
         let mut names = BTreeSet::new();
         for route in &self.routes {
             ensure!(names.insert(&route.name), "duplicate route {}", route.name);
@@ -276,6 +307,7 @@ impl Config {
     /// Nodes without a configured route can be reached directly. Explicit
     /// routes (including disabled ones) take precedence over this fallback.
     pub fn effective_routes(&self) -> Vec<Route> {
+        if self.graph_mode() { return crate::routing::discover(self).0; }
         let mut routes = self.routes.clone();
         let mut names: BTreeSet<String> = routes.iter().map(|r| r.name.clone()).collect();
         for id in self.nodes.keys() {
@@ -302,6 +334,10 @@ impl Config {
         routes
     }
 
+    pub fn graph_mode(&self) -> bool {
+        !self.direct_hosts.is_empty() || !self.paths.is_empty()
+    }
+
     pub fn routes_for(&self, target: &str) -> Vec<Route> {
         self.effective_routes()
             .into_iter()
@@ -320,6 +356,75 @@ pub fn default_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn graph_sample() -> Config {
+        toml::from_str(r#"
+            direct_hosts = ["edge_a", "edge_b"]
+            paths = [
+                ["edge_a", "relay"],
+                ["relay", "hub"],
+                ["edge_b", "hub"],
+                ["hub", "target"],
+            ]
+            [nodes.edge_a]
+            host = "edge-a"
+            user = "alice"
+            key_file = "key"
+            [nodes.edge_b]
+            host = "edge-b"
+            user = "alice"
+            key_file = "key"
+            [nodes.relay]
+            host = "relay"
+            user = "alice"
+            key_file = "key"
+            [nodes.hub]
+            host = "hub"
+            user = "alice"
+            key_file = "key"
+            [nodes.target]
+            host = "target"
+            user = "alice"
+            key_file = "key"
+        "#).unwrap()
+    }
+
+    #[test]
+    fn composes_short_paths_in_list_priority_order() {
+        let config = graph_sample();
+        config.validate().unwrap();
+        let routes = config.routes_for("target");
+        assert_eq!(routes.iter().map(|route| route.hops.as_slice()).collect::<Vec<_>>(), [
+            &["edge_a", "relay", "hub", "target"][..],
+            &["edge_b", "hub", "target"][..],
+        ]);
+        assert_eq!(routes.iter().map(|route| route.name.as_str()).collect::<Vec<_>>(),
+            ["target-1", "target-2"]);
+        assert_eq!(config.routes_for("hub")[0].hops, ["edge_a", "relay", "hub"]);
+        assert_eq!(config.routes_for("relay")[0].hops, ["edge_a", "relay"]);
+        assert_eq!(config.routes_for("edge_a")[0].hops, ["edge_a"]);
+        assert!(config.routes_for("missing").is_empty());
+    }
+
+    #[test]
+    fn long_path_exposes_every_prefix() {
+        let mut config = graph_sample();
+        config.paths = vec![vec!["edge_a".into(), "relay".into(), "hub".into(), "target".into()]];
+        config.validate().unwrap();
+        assert_eq!(config.routes_for("relay")[0].hops, ["edge_a", "relay"]);
+        assert_eq!(config.routes_for("hub")[0].hops, ["edge_a", "relay", "hub"]);
+        assert_eq!(config.routes_for("target")[0].hops, ["edge_a", "relay", "hub", "target"]);
+        assert!(config.routes_for("edge_b").len() == 1);
+    }
+
+    #[test]
+    fn graph_requires_reachable_declared_hosts() {
+        let mut config = graph_sample();
+        config.paths = vec![vec!["relay".into(), "hub".into()]];
+        assert!(config.validate().unwrap_err().to_string().contains("unreachable"));
+        config.paths = vec![vec!["edge_a".into(), "missing".into()]];
+        assert!(config.validate().unwrap_err().to_string().contains("unknown node"));
+    }
 
     fn sample() -> Config {
         toml::from_str(
