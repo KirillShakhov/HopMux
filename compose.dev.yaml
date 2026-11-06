@@ -1,0 +1,17 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    working_dir: /workspace
+    volumes:
+      - .:/workspace
+      - cargo_cache:/usr/local/cargo
+      - target_cache:/workspace/target
+    command: ["sleep", "infinity"]
+
+volumes:
+  cargo_cache:
+    name: hopmux-cargo-cache
+  target_cache:
+    name: hopmux-target-cache

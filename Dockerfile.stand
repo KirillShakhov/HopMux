@@ -1,0 +1,13 @@
+FROM alpine:3.23
+
+RUN apk add --no-cache openssh-server iproute2 iputils tmux screen nano \
+    && adduser -D -h /home/mssh -s /bin/sh mssh \
+    && passwd -d mssh \
+    && mkdir -p /run/sshd /home/mssh/data \
+    && chown -R mssh:mssh /home/mssh
+
+COPY tests/compose-stand/keys.sh /usr/local/bin/stand-keys
+COPY tests/compose-stand/server.sh /usr/local/bin/stand-server
+RUN chmod +x /usr/local/bin/stand-keys /usr/local/bin/stand-server
+
+ENTRYPOINT ["/usr/local/bin/stand-server"]

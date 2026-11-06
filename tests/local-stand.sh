@@ -90,6 +90,13 @@ edge_b_pin="$(ssh-keygen -lf "$stand_dir/edge_b-host-key.pub" -E sha256 | awk '{
 target_pin="$(ssh-keygen -lf "$stand_dir/target-host-key.pub" -E sha256 | awk '{print $2}')"
 
 cat > "$stand_dir/config.toml" <<EOF
+direct_hosts = ["edge_a", "edge_b"]
+paths = [
+  ["edge_a", "target"],
+  ["edge_b", "target"],
+  ["edge_a", "edge_b", "target"],
+]
+
 [settings]
 connect_timeout_secs = 5
 check_interval_secs = 10
@@ -117,23 +124,6 @@ user = "$stand_user"
 host_key = "$target_pin"
 key_file = "$stand_dir/client-key"
 
-[[routes]]
-name = "via-a"
-target = "target"
-hops = ["edge_a", "target"]
-priority = 0
-
-[[routes]]
-name = "via-b"
-target = "target"
-hops = ["edge_b", "target"]
-priority = 1
-
-[[routes]]
-name = "via-a-b"
-target = "target"
-hops = ["edge_a", "edge_b", "target"]
-priority = 2
 EOF
 chown "$stand_user" "$stand_dir/config.toml"
 chmod 600 "$stand_dir/config.toml"

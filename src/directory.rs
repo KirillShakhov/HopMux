@@ -66,12 +66,14 @@ async fn set_remote_metadata(
 ) -> Result<()> {
     let attrs = local_attributes(metadata);
     if attrs.permissions.is_some() || attrs.mtime.is_some() {
+        crate::debug_log!("directory: setting remote metadata on {path}");
         sftp.set_metadata(path, attrs).await?;
     }
     Ok(())
 }
 
 fn set_local_metadata(path: &Path, attrs: &FileAttributes) -> Result<()> {
+    crate::debug_log!("directory: setting local metadata on {}", path.display());
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -91,6 +93,7 @@ pub async fn put_directory(
     source: &Path,
     destination: &str,
 ) -> Result<()> {
+    crate::debug_log!("directory upload: local:{} -> {}:{}", source.display(), target, destination);
     ensure!(source.is_dir(), "local source is not a directory");
     ensure!(
         destination.starts_with('/'),
@@ -103,6 +106,7 @@ pub async fn put_directory(
         "remote destination already exists"
     );
     sftp.create_dir(destination).await?;
+    crate::debug_log!("directory upload: created remote directory {destination}");
     let mut stack = vec![(source.to_path_buf(), destination.to_owned())];
     let mut directories = Vec::new();
     while let Some((local_dir, remote_dir)) = stack.pop() {
@@ -114,6 +118,7 @@ pub async fn put_directory(
             let remote = remote_child(&remote_dir, name);
             let metadata = fs::symlink_metadata(&local)?;
             if metadata.file_type().is_symlink() {
+                crate::debug_log!("directory upload: symlink local:{} -> {}:{remote}", local.display(), target);
                 #[cfg(unix)]
                 {
                     let link = fs::read_link(&local)?;
@@ -123,9 +128,11 @@ pub async fn put_directory(
                 #[cfg(not(unix))]
                 bail!("symbolic link transfer requires Linux");
             } else if metadata.is_dir() {
+                crate::debug_log!("directory upload: creating remote directory {remote}");
                 sftp.create_dir(&remote).await?;
                 stack.push((local, remote));
             } else if metadata.is_file() {
+                crate::debug_log!("directory upload: file local:{} -> {}:{remote}", local.display(), target);
                 transfer::put(config, target, &local, &remote).await?;
                 set_remote_metadata(&sftp, &remote, &metadata).await?;
             } else {
@@ -136,6 +143,7 @@ pub async fn put_directory(
     for (remote, metadata) in directories.into_iter().rev() {
         set_remote_metadata(&sftp, &remote, &metadata).await?;
     }
+    crate::debug_log!("directory upload: completed {destination}");
     Ok(())
 }
 
@@ -145,6 +153,7 @@ pub async fn get_directory(
     source: &str,
     destination: &Path,
 ) -> Result<()> {
+    crate::debug_log!("directory download: {}:{} -> local:{}", target, source, destination.display());
     ensure!(
         source.starts_with('/'),
         "remote source must be an absolute path"
@@ -158,6 +167,7 @@ pub async fn get_directory(
         "remote source is not a directory"
     );
     fs::create_dir(destination)?;
+    crate::debug_log!("directory download: created local directory {}", destination.display());
     let mut stack = vec![(source.to_owned(), destination.to_path_buf())];
     let mut directories: Vec<(PathBuf, FileAttributes)> = Vec::new();
     while let Some((remote_dir, local_dir)) = stack.pop() {
@@ -171,14 +181,17 @@ pub async fn get_directory(
             let attrs = sftp.symlink_metadata(&remote).await?;
             match attrs.file_type() {
                 FileType::Dir => {
+                    crate::debug_log!("directory download: creating local directory {}", local.display());
                     fs::create_dir(&local)?;
                     stack.push((remote, local));
                 }
                 FileType::File => {
+                    crate::debug_log!("directory download: file {}:{remote} -> local:{}", target, local.display());
                     transfer::get(config, target, &remote, &local).await?;
                     set_local_metadata(&local, &attrs)?;
                 }
                 FileType::Symlink => {
+                    crate::debug_log!("directory download: symlink {}:{remote} -> local:{}", target, local.display());
                     #[cfg(unix)]
                     {
                         let link = sftp.read_link(&remote).await?;
@@ -194,6 +207,7 @@ pub async fn get_directory(
     for (local, attrs) in directories.into_iter().rev() {
         set_local_metadata(&local, &attrs)?;
     }
+    crate::debug_log!("directory download: completed {}", destination.display());
     Ok(())
 }
 

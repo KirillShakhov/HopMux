@@ -1,0 +1,8 @@
+FROM rust:1.98.1-alpine3.23
+
+RUN apk add --no-cache iproute2 iputils openssh-client
+COPY tests/compose-stand/client.sh /usr/local/bin/stand-client
+RUN chmod +x /usr/local/bin/stand-client
+
+WORKDIR /workspace
+ENTRYPOINT ["/usr/local/bin/stand-client"]

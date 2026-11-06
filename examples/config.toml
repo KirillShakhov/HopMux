@@ -3,10 +3,15 @@
 # To pin a node, obtain its fingerprint over a trusted channel and add:
 # host_key = "SHA256:..."
 
+direct_hosts = ["edge_a", "edge_b"]
+paths = [
+  ["edge_a", "internal"],
+  ["edge_b", "internal"],
+]
+
 [settings]
 connect_timeout_secs = 10
 check_interval_secs = 30
-max_parallel_routes = 3
 chunk_size = 1048576
 
 [nodes.edge_a]
@@ -23,18 +28,3 @@ agent = true
 host = "10.0.0.15"
 user = "alice"
 password = "REPLACE_WITH_PASSWORD"
-
-[[routes]]
-name = "via-a"
-target = "internal"
-hops = ["edge_a", "internal"]
-priority = 0
-
-[[routes]]
-name = "via-b"
-target = "internal"
-hops = ["edge_b", "internal"]
-priority = 10
-
-[routes.addresses]
-internal = "10.10.0.15"
