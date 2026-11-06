@@ -56,6 +56,28 @@ Uploads verify each written chunk and the final SHA-256 before publishing. Downl
 
 Background transfers need the client computer to stay running. A partial download can be continued only where its local `.part` file is available; on another computer it must be restarted. Remote state requires write access to the SSH account's home directory. Recursive directory copies cannot yet continue as one operation after an interruption; individual files have remote journals. SSH host certificates are rejected until CA and principal validation are configured.
 
-## Local integration stand
+## Docker network test stand
 
-On Ubuntu WSL, run `tests/local-stand.sh` as root with the ordinary Linux username as its argument. The script starts three loopback SSH servers on ports 37221–37223 and writes `/tmp/hopmux-stand/config.toml`. Run `tests/local-stand.sh stop` to stop them.
+`compose.test.yaml` builds a separate SSH test network. Five routes start at five entry nodes. Routes 1–3 each have one relay; routes 4–5 each have two. All routes then pass through `hub` to `target`. Each route has two LTE bottlenecks at the same per-route rate: the client-to-entry link and the link after the second SSH hop on routes 1–3 or after the third SSH hop on routes 4–5. Other links are shaped to 1 Gbit/s. Each adjacent pair has its own Docker network, apart from the shared client-to-entry front network. The client cannot directly resolve or reach `target`. SSH host keys are generated for the stand and pinned in the client's generated `/data/config.toml`.
+
+| Route | Both LTE links, each direction | Additional relays | Link RTTs, from client to target |
+| --- | ---: | --- | --- |
+| `path1` | 0.5 Mbit/s | `relay1` | 100, 150, 200, 200 ms |
+| `path2` | 0.75 Mbit/s | `relay2` | 125, 200, 250, 200 ms |
+| `path3` | 1.0 Mbit/s | `relay3` | 150, 250, 300, 200 ms |
+| `path4` | 1.25 Mbit/s | `relay4`, `relay4b` | 175, 300, 100, 200, 200 ms |
+| `path5` | 1.5 Mbit/s | `relay5`, `relay5b` | 200, 100, 150, 250, 200 ms |
+
+The RTT values are configured round trips for an individual link; actual `ping` results include Docker scheduling overhead. `relay3` to `hub` has 0.1% background loss and a four-second 3% loss burst every 30 seconds.
+
+```sh
+docker compose -f compose.test.yaml up -d --build --wait --wait-timeout 900
+python3 tests/compose-stand/check.py
+docker compose -f compose.test.yaml exec -T client mssh --config /data/config.toml status target --details
+docker compose -f compose.test.yaml exec -T client sh -c 'dd if=/dev/urandom of=/data/sample.bin bs=1M count=16 status=none && mssh --config /data/config.toml /data/sample.bin target:/home/mssh/data/sample.bin'
+docker compose -f compose.test.yaml exec -T client sha256sum /data/sample.bin
+docker compose -f compose.test.yaml exec -T target sha256sum /home/mssh/data/sample.bin
+docker compose -f compose.test.yaml down
+```
+
+For another copy, choose a new destination filename; `mssh` does not overwrite the previous result. The stand uses named volumes for its keys, client test data, build cache, and target's home directory. Use `docker compose -f compose.test.yaml down -v` to remove them, including transfer journals. The older `tests/local-stand.sh` remains available for Ubuntu WSL; run it as root with the ordinary Linux username, and use `tests/local-stand.sh stop` to stop it.

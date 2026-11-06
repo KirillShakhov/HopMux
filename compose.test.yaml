@@ -1,0 +1,203 @@
+name: hopmux-test
+
+# Each SSH host can only see its adjacent network peers.
+x-sshd: &sshd
+  build:
+    context: .
+    dockerfile: Dockerfile.stand
+  cap_add: [NET_ADMIN]
+  volumes:
+    - stand_keys:/keys:ro
+  depends_on:
+    keys:
+      condition: service_completed_successfully
+  healthcheck:
+    test: ["CMD", "nc", "-z", "127.0.0.1", "22"]
+    interval: 5s
+    timeout: 2s
+    retries: 15
+
+services:
+  keys:
+    build:
+      context: .
+      dockerfile: Dockerfile.stand
+    entrypoint: ["/usr/local/bin/stand-keys"]
+    network_mode: none
+    volumes:
+      - stand_keys:/keys
+
+  client:
+    build:
+      context: .
+      dockerfile: Dockerfile.test-client
+    cap_add: [NET_ADMIN]
+    volumes:
+      - .:/workspace
+      - stand_keys:/keys:ro
+      - stand_client_data:/data
+      - stand_cargo_cache:/usr/local/cargo
+      - stand_target_cache:/workspace/target
+    depends_on:
+      keys:
+        condition: service_completed_successfully
+      entry1: {condition: service_started}
+      entry2: {condition: service_started}
+      entry3: {condition: service_started}
+      entry4: {condition: service_started}
+      entry5: {condition: service_started}
+      relay1: {condition: service_healthy}
+      relay2: {condition: service_healthy}
+      relay3: {condition: service_healthy}
+      relay4: {condition: service_healthy}
+      relay4b: {condition: service_healthy}
+      relay5: {condition: service_healthy}
+      relay5b: {condition: service_healthy}
+      hub: {condition: service_healthy}
+      target: {condition: service_healthy}
+    networks: [front]
+    healthcheck:
+      test: ["CMD-SHELL", "test -x /usr/local/bin/mssh && test -f /data/config.toml"]
+      interval: 10s
+      timeout: 2s
+      start_period: 10m
+      retries: 3
+
+  entry1:
+    <<: *sshd
+    environment:
+      STAND_NAME: entry1
+      NETEM_RULES: "client:50ms:500kbit:0;relay1:75ms:1gbit:0"
+    networks: [front, e1r1]
+
+  entry2:
+    <<: *sshd
+    environment:
+      STAND_NAME: entry2
+      NETEM_RULES: "client:75ms:750kbit:0;relay2:100ms:1gbit:0"
+    networks: [front, e2r2]
+
+  entry3:
+    <<: *sshd
+    environment:
+      STAND_NAME: entry3
+      NETEM_RULES: "client:100ms:1000kbit:0;relay3:125ms:1gbit:0"
+    networks: [front, e3r3]
+
+  entry4:
+    <<: *sshd
+    environment:
+      STAND_NAME: entry4
+      NETEM_RULES: "client:125ms:1250kbit:0;relay4:150ms:1gbit:0"
+    networks: [front, e4r4]
+
+  entry5:
+    <<: *sshd
+    environment:
+      STAND_NAME: entry5
+      NETEM_RULES: "client:150ms:1500kbit:0;relay5:50ms:1gbit:0"
+    networks: [front, e5r5]
+
+  relay1:
+    <<: *sshd
+    environment:
+      STAND_NAME: relay1
+      NETEM_RULES: "entry1:75ms:1gbit:0;hub:100ms:500kbit:0"
+    networks: [e1r1, r1hub]
+
+  relay2:
+    <<: *sshd
+    environment:
+      STAND_NAME: relay2
+      NETEM_RULES: "entry2:100ms:1gbit:0;hub:125ms:750kbit:0"
+    networks: [e2r2, r2hub]
+
+  relay3:
+    <<: *sshd
+    environment:
+      STAND_NAME: relay3
+      NETEM_RULES: "entry3:125ms:1gbit:0;hub:150ms:1000kbit:0.1%"
+      PERIODIC_LOSS_PEER: hub
+      PERIODIC_LOSS_DELAY: 150ms
+    networks: [e3r3, r3hub]
+
+  relay4:
+    <<: *sshd
+    environment:
+      STAND_NAME: relay4
+      NETEM_RULES: "entry4:150ms:1gbit:0;relay4b:50ms:1gbit:0"
+    networks: [e4r4, r4r4b]
+
+  relay4b:
+    <<: *sshd
+    environment:
+      STAND_NAME: relay4b
+      NETEM_RULES: "relay4:50ms:1gbit:0;hub:100ms:1250kbit:0"
+    networks: [r4r4b, r4bhub]
+
+  relay5:
+    <<: *sshd
+    environment:
+      STAND_NAME: relay5
+      NETEM_RULES: "entry5:50ms:1gbit:0;relay5b:75ms:1gbit:0"
+    networks: [e5r5, r5r5b]
+
+  relay5b:
+    <<: *sshd
+    environment:
+      STAND_NAME: relay5b
+      NETEM_RULES: "relay5:75ms:1gbit:0;hub:125ms:1500kbit:0"
+    networks: [r5r5b, r5bhub]
+
+  hub:
+    <<: *sshd
+    environment:
+      STAND_NAME: hub
+      NETEM_RULES: "relay1:100ms:500kbit:0;relay2:125ms:750kbit:0;relay3:150ms:1000kbit:0;relay4b:100ms:1250kbit:0;relay5b:125ms:1500kbit:0;target:100ms:1gbit:0"
+    networks: [r1hub, r2hub, r3hub, r4bhub, r5bhub, tail]
+
+  target:
+    <<: *sshd
+    environment:
+      STAND_NAME: target
+      NETEM_RULES: "hub:100ms:1gbit:0"
+    volumes:
+      - stand_keys:/keys:ro
+      - stand_target_home:/home/mssh
+    networks: [tail]
+
+networks:
+  front:
+  e1r1:
+    internal: true
+  e2r2:
+    internal: true
+  e3r3:
+    internal: true
+  e4r4:
+    internal: true
+  e5r5:
+    internal: true
+  r1hub:
+    internal: true
+  r2hub:
+    internal: true
+  r3hub:
+    internal: true
+  r4r4b:
+    internal: true
+  r5r5b:
+    internal: true
+  r4bhub:
+    internal: true
+  r5bhub:
+    internal: true
+  tail:
+    internal: true
+
+volumes:
+  stand_keys:
+  stand_client_data:
+  stand_cargo_cache:
+  stand_target_cache:
+  stand_target_home:
