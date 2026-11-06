@@ -313,6 +313,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn shell_uses_automatic_mode_unless_overridden() {
+        let automatic = Cli::try_parse_from(["mssh", "edge_a"]).unwrap();
+        assert_eq!(automatic.shell_mode, "auto");
+        assert_eq!(automatic.shell_check_interval, 30);
+        let forced = Cli::try_parse_from([
+            "mssh", "--shell-mode", "screen", "--shell-min-rate", "4096",
+            "--shell-max-rtt-ms", "1500", "--shell-check-interval", "0", "edge_a",
+        ]).unwrap();
+        assert_eq!(forced.shell_mode, "screen");
+        assert_eq!(forced.shell_min_rate, 4096);
+        assert_eq!(forced.shell_max_rtt_ms, 1500);
+        assert_eq!(forced.shell_check_interval, 0);
+    }
+
+    #[test]
     fn parses_scp_style_copy_and_background_options() {
         let copy = Cli::try_parse_from(["mssh", "edge_a:/home/test.yml", "./downloads/"]).unwrap();
         assert_eq!(copy.args, ["edge_a:/home/test.yml", "./downloads/"]);

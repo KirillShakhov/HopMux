@@ -581,6 +581,15 @@ pub async fn execute_copy(config: &Config, plan: CopyPlan, action: PartialAction
 mod shell_tests {
     use super::*;
 
+    fn options() -> ShellOptions {
+        ShellOptions {
+            preference: ShellPreference::Auto,
+            min_rate_bytes_per_sec: 2048,
+            max_rtt: Duration::from_millis(2000),
+            check_interval: Some(Duration::from_secs(30)),
+        }
+    }
+
     #[test]
     fn chooses_installed_terminal_multiplexer_in_order() {
         assert_eq!(choose_shell_mode(ShellPreference::Auto, true, true), ShellMode::Tmux);
@@ -589,5 +598,29 @@ mod shell_tests {
         assert_eq!(choose_shell_mode(ShellPreference::Screen, true, true), ShellMode::Screen);
         assert_eq!(choose_shell_mode(ShellPreference::Tmux, false, true), ShellMode::Plain);
         assert_eq!(choose_shell_mode(ShellPreference::Plain, true, true), ShellMode::Plain);
+    }
+
+    #[test]
+    fn interactive_quality_prefers_usable_route_and_keeps_slow_fallback() {
+        let slow = InteractiveQuality {
+            rtt: Some(Duration::from_millis(3000)),
+            bytes_per_second: Some(500),
+        };
+        let usable = InteractiveQuality {
+            rtt: Some(Duration::from_millis(500)),
+            bytes_per_second: Some(4000),
+        };
+        let slightly_better_but_slow = InteractiveQuality {
+            rtt: Some(Duration::from_millis(2800)),
+            bytes_per_second: Some(600),
+        };
+        assert!(!slow.sufficient(options()));
+        assert!(usable.sufficient(options()));
+        assert!(better_shell_route(slow, usable, options()));
+        assert!(!better_shell_route(slow, slightly_better_but_slow, options()));
+        assert!(better_shell_route(slow, InteractiveQuality {
+            rtt: Some(Duration::from_millis(1200)),
+            bytes_per_second: Some(1500),
+        }, options()));
     }
 }
