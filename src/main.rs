@@ -260,7 +260,7 @@ async fn show_status(config: &Config, target: Option<&str>, json: bool, details:
             }
         }
         for route in &routes {
-            println!("{}: {}: {} connect={:?}ms rtt={:?}ms{}", route.route, output::route_chain(&route.hops), route.state, route.connect_ms, route.rtt_ms, route.error.as_ref().map_or(String::new(), |e| format!(" {e}")));
+            println!("{}: {}: {} connect={} rtt={}{}", route.route, output::route_chain(&route.hops), route.state, output::optional_ms(route.connect_ms), output::optional_ms(route.rtt_ms), route.error.as_ref().map_or(String::new(), |e| format!(" {e}")));
             if details {
                 let mut previous = "local";
                 for hop in &route.hop_timings {

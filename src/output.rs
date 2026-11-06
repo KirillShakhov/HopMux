@@ -15,7 +15,11 @@ pub fn route_label_by_name(config: &Config, target: &str, name: &str) -> String 
     config.effective_routes().into_iter()
         .find(|route| route.target == target && route.name == name)
         .map(|route| route_label(&route))
-        .unwrap_or_else(|| name.to_owned())
+        .unwrap_or_else(|| format!("{name}: local -> [unknown hops] -> {target}"))
+}
+
+pub fn optional_ms(value: Option<u128>) -> String {
+    value.map_or_else(|| "-".to_owned(), |milliseconds| format!("{milliseconds}ms"))
 }
 
 pub fn transfer_chain(journal: &Journal) -> String {
@@ -34,5 +38,11 @@ mod tests {
         assert_eq!(route_chain(&["entry".into(), "relay".into(), "target".into()]),
             "local -> entry -> relay -> target");
         assert_eq!(route_chain(&["target".into()]), "local -> target");
+    }
+
+    #[test]
+    fn durations_do_not_show_debug_option_syntax() {
+        assert_eq!(optional_ms(Some(17)), "17ms");
+        assert_eq!(optional_ms(None), "-");
     }
 }
