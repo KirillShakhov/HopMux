@@ -20,6 +20,8 @@ use uuid::Uuid;
 
 const MAX_ROUTE_ATTEMPTS: u32 = 3;
 const ATOM_SIZE: usize = 256 * 1024;
+const CHECKPOINT_BYTES: u64 = 16 * 1024 * 1024;
+const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(30);
 
 fn default_verify() -> bool { true }
 
@@ -75,6 +77,10 @@ pub struct Journal {
     pub worker_pid: u32,
     #[serde(default)]
     pub updated_at_unix_ms: u128,
+    #[serde(skip, default = "Instant::now")]
+    pub checkpoint_at: Instant,
+    #[serde(skip)]
+    pub uncheckpointed_bytes: u64,
 }
 
 fn worker_host() -> String {
@@ -111,7 +117,8 @@ pub fn is_active(journal: &Journal) -> bool {
     }
     #[cfg(not(unix))]
     let _ = same_host;
-    now_unix_ms().saturating_sub(journal.updated_at_unix_ms) < 30_000
+    let lease_ms = u128::from(journal.chunk_timeout_secs.unwrap_or(120).max(120).saturating_add(60)) * 1000;
+    now_unix_ms().saturating_sub(journal.updated_at_unix_ms) < lease_ms
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -197,7 +204,7 @@ fn now_unix_ms() -> u128 {
         .as_millis()
 }
 
-async fn note_session(shared: &Arc<Mutex<Journal>>, route: &str, connect: Duration, sftp: &SftpSession) -> Result<()> {
+async fn note_session(shared: &Arc<Mutex<Journal>>, route: &str, connect: Duration) {
     let mut journal = shared.lock().await;
     journal.updated_at_unix_ms = now_unix_ms();
     let stats = journal.route_stats.entry(route.to_owned()).or_default();
@@ -208,7 +215,6 @@ async fn note_session(shared: &Arc<Mutex<Journal>>, route: &str, connect: Durati
     stats.connect_ms = stats.connect_ms.saturating_add(connect.as_millis());
     stats.pending_connect_ms = connect.as_millis();
     crate::debug_log!("transfer {}: route {} session opened", journal.id, route);
-    save(sftp, &journal).await
 }
 
 async fn note_worker_finished(
@@ -219,13 +225,17 @@ async fn note_worker_finished(
     sftp: &SftpSession,
 ) -> Result<()> {
     let mut journal = shared.lock().await;
+    journal.updated_at_unix_ms = now_unix_ms();
     let stats = journal.route_stats.entry(route.to_owned()).or_default();
     stats.session_ms = stats.session_ms.saturating_add(elapsed.as_millis());
     if failed {
         stats.failed_session_ms = stats.failed_session_ms.saturating_add(elapsed.as_millis());
     }
     crate::debug_log!("transfer {}: route {} session ended after {} ms, failed={failed}", journal.id, route, elapsed.as_millis());
-    save(sftp, &journal).await
+    save(sftp, &journal).await?;
+    journal.uncheckpointed_bytes = 0;
+    journal.checkpoint_at = Instant::now();
+    Ok(())
 }
 
 async fn note_error(shared: &Arc<Mutex<Journal>>, route: &str, error: &anyhow::Error, sftp: &SftpSession) -> Result<()> {
@@ -296,7 +306,12 @@ async fn note_batch(
     );
     stats.last_at_unix_ms = now_unix_ms();
     crate::debug_log!("transfer {}: atoms {}..={} offset={} bytes={} route={} elapsed={} ms committed", journal.id, indices[0], indices[indices.len() - 1], indices[0] as u64 * journal.chunk_size as u64, bytes, route, elapsed.as_millis());
-    save(sftp, &journal).await?;
+    journal.uncheckpointed_bytes = journal.uncheckpointed_bytes.saturating_add(bytes as u64);
+    if journal.uncheckpointed_bytes >= CHECKPOINT_BYTES || journal.checkpoint_at.elapsed() >= CHECKPOINT_INTERVAL {
+        save(sftp, &journal).await?;
+        journal.uncheckpointed_bytes = 0;
+        journal.checkpoint_at = Instant::now();
+    }
     if journal.adaptive && bytes >= selected_size {
         let min = journal.min_batch_size.max(journal.chunk_size);
         let max = journal.max_batch_size.max(min);
@@ -609,6 +624,8 @@ pub async fn put(config: &Config, target: &str, source: &Path, destination: &str
         worker_host: worker_host(),
         worker_pid: std::process::id(),
         updated_at_unix_ms: now_unix_ms(),
+        checkpoint_at: Instant::now(),
+        uncheckpointed_bytes: 0,
     };
     ensure!(
         !sftp.try_exists(destination).await?,
@@ -749,7 +766,7 @@ async fn put_worker(
         Ok(sftp) => sftp,
         Err(error) => { note_failed_connection(&shared, &route.name, connect_started).await; return Err(error); }
     };
-    note_session(&shared, &route.name, connect_started.elapsed(), &sftp).await?;
+    note_session(&shared, &route.name, connect_started.elapsed()).await;
     let snapshot = shared.lock().await.clone();
     let mut local = tokio::fs::File::open(&snapshot.source).await?;
     loop {
@@ -872,6 +889,8 @@ pub async fn get(config: &Config, target: &str, source: &str, destination: &Path
         worker_host: worker_host(),
         worker_pid: std::process::id(),
         updated_at_unix_ms: now_unix_ms(),
+        checkpoint_at: Instant::now(),
+        uncheckpointed_bytes: 0,
     };
     if let Err(error) = save(&sftp, &journal).await {
         let _ = fs::remove_file(&journal.temporary);
@@ -992,7 +1011,7 @@ async fn get_worker(
         Ok(sftp) => sftp,
         Err(error) => { note_failed_connection(&shared, &route.name, connect_started).await; return Err(error); }
     };
-    note_session(&shared, &route.name, connect_started.elapsed(), &sftp).await?;
+    note_session(&shared, &route.name, connect_started.elapsed()).await;
     let snapshot = shared.lock().await.clone();
     let metadata = sftp.metadata(&snapshot.source).await?;
     let mtime = metadata
