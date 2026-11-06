@@ -21,6 +21,8 @@ use uuid::Uuid;
 const MAX_ROUTE_ATTEMPTS: u32 = 3;
 const ATOM_SIZE: usize = 256 * 1024;
 
+fn default_verify() -> bool { true }
+
 fn atom_size(config: &Config) -> usize {
     fn gcd(mut a: usize, mut b: usize) -> usize {
         while b != 0 { (a, b) = (b, a % b); }
@@ -46,6 +48,8 @@ pub struct Journal {
     pub size: u64,
     pub source_mtime: Option<u64>,
     pub sha256: String,
+    #[serde(default = "default_verify")]
+    pub verify: bool,
     pub chunk_size: usize,
     #[serde(default)]
     pub batch_size: usize,
@@ -291,7 +295,7 @@ async fn note_batch(
             .map_or(sample_bps, |old| old * 0.7 + sample_bps * 0.3),
     );
     stats.last_at_unix_ms = now_unix_ms();
-    crate::debug_log!("transfer {}: atoms {}..={} offset={} bytes={} route={} elapsed={} ms verified", journal.id, indices[0], indices[indices.len() - 1], indices[0] as u64 * journal.chunk_size as u64, bytes, route, elapsed.as_millis());
+    crate::debug_log!("transfer {}: atoms {}..={} offset={} bytes={} route={} elapsed={} ms committed", journal.id, indices[0], indices[indices.len() - 1], indices[0] as u64 * journal.chunk_size as u64, bytes, route, elapsed.as_millis());
     save(sftp, &journal).await?;
     if journal.adaptive && bytes >= selected_size {
         let min = journal.min_batch_size.max(journal.chunk_size);
@@ -550,6 +554,16 @@ async fn local_hash(path: &Path) -> Result<(u64, String, Option<u64>)> {
     Ok((metadata.len(), digest, modified))
 }
 
+async fn local_source(path: &Path, verify: bool) -> Result<(u64, String, Option<u64>)> {
+    if verify { return local_hash(path).await; }
+    let metadata = tokio::fs::metadata(path).await?;
+    ensure!(metadata.is_file(), "source is not a regular file");
+    let modified = metadata.modified().ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|time| time.as_secs());
+    Ok((metadata.len(), String::new(), modified))
+}
+
 pub async fn put(config: &Config, target: &str, source: &Path, destination: &str) -> Result<Uuid> {
     crate::debug_log!("upload: {} -> {}:{}", source.display(), target, destination);
     let routes = config.routes_for(target);
@@ -558,7 +572,7 @@ pub async fn put(config: &Config, target: &str, source: &Path, destination: &str
         destination.starts_with('/'),
         "remote destination must be an absolute path"
     );
-    let (size, sha256, source_mtime) = local_hash(source).await?;
+    let (size, sha256, source_mtime) = local_source(source, config.verify).await?;
     let id = Uuid::new_v4();
     let temporary = format!("{destination}.mssh-{id}.part");
     let atom_size = atom_size(config);
@@ -580,6 +594,7 @@ pub async fn put(config: &Config, target: &str, source: &Path, destination: &str
         size,
         source_mtime,
         sha256,
+        verify: config.verify,
         chunk_size: atom_size,
         batch_size: initial_batch_size,
         adaptive: config.auto_chunk,
@@ -623,7 +638,7 @@ async fn process_put(
 ) -> Result<()> {
     crate::debug_log!("upload {}: processing {} pending chunks", journal.id, journal.complete.iter().filter(|&&done| !done).count());
     let source = Path::new(&journal.source);
-    let (size, sha256, mtime) = local_hash(source).await?;
+    let (size, sha256, mtime) = local_source(source, journal.verify).await?;
     ensure!(
         size == journal.size && sha256 == journal.sha256 && mtime == journal.source_mtime,
         "source changed since transfer began"
@@ -689,12 +704,16 @@ async fn process_put(
         }
     }
     *journal = shared.lock().await.clone();
-    let digest = remote_hash(control_connection, control_sftp, &journal.temporary, journal.chunk_size).await?;
-    ensure!(
-        digest == journal.sha256,
-        "remote SHA-256 differs; temporary file retained"
-    );
-    crate::debug_log!("upload {}: remote SHA-256 verified", journal.id);
+    let (source_size, _, source_mtime) = local_source(Path::new(&journal.source), false).await?;
+    ensure!(source_size == journal.size && source_mtime == journal.source_mtime,
+        "source changed during upload; temporary file retained");
+    ensure!(control_sftp.metadata(&journal.temporary).await?.len() == journal.size,
+        "remote part size differs; temporary file retained");
+    if journal.verify {
+        let digest = remote_hash(control_connection, control_sftp, &journal.temporary, journal.chunk_size).await?;
+        ensure!(digest == journal.sha256, "remote SHA-256 differs; temporary file retained");
+        crate::debug_log!("upload {}: remote SHA-256 verified", journal.id);
+    }
     ensure!(
         !control_sftp.try_exists(&journal.destination).await?,
         "destination appeared during upload"
@@ -751,13 +770,6 @@ async fn put_worker(
             remote.seek(SeekFrom::Start(offset)).await?;
             remote.write_all(&buffer).await?;
             remote.close().await?;
-            let mut check = sftp.open(&snapshot.temporary).await?;
-            check.seek(SeekFrom::Start(offset)).await?;
-            let mut readback = vec![0u8; length];
-            check.read_exact(&mut readback).await?;
-            check.close().await?;
-            ensure!(Sha256::digest(&buffer) == Sha256::digest(&readback),
-                "remote batch starting at atom {} differs after write", group[0]);
             Ok::<(), anyhow::Error>(())
         };
         let result = tokio::time::timeout(Duration::from_secs(snapshot.chunk_timeout_secs.unwrap_or(120)), batch_io).await;
@@ -816,7 +828,8 @@ pub async fn get(config: &Config, target: &str, source: &str, destination: &Path
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|t| t.as_secs());
-    let sha256 = remote_hash(&connection, &sftp, source, config.settings.chunk_size).await?;
+    let sha256 = if config.verify { remote_hash(&connection, &sftp, source, config.settings.chunk_size).await? }
+        else { String::new() };
     crate::debug_log!("download: source size={size} bytes, SHA-256 {sha256}");
     let id = Uuid::new_v4();
     let atom_size = atom_size(config);
@@ -844,6 +857,7 @@ pub async fn get(config: &Config, target: &str, source: &str, destination: &Path
         size,
         source_mtime,
         sha256,
+        verify: config.verify,
         chunk_size: atom_size,
         batch_size: initial_batch_size,
         adaptive: config.auto_chunk,
@@ -938,12 +952,21 @@ async fn process_get(config: &Config, journal: &mut Journal, control_sftp: &Sftp
         }
     }
     *journal = shared.lock().await.clone();
-    let (size, sha256, _) = local_hash(Path::new(&journal.temporary)).await?;
-    ensure!(
-        size == journal.size && sha256 == journal.sha256,
-        "downloaded SHA-256 differs; temporary file retained"
-    );
-    crate::debug_log!("download {}: local SHA-256 verified", journal.id);
+    if journal.verify {
+        let (size, sha256, _) = local_hash(Path::new(&journal.temporary)).await?;
+        ensure!(size == journal.size && sha256 == journal.sha256,
+            "downloaded SHA-256 differs; temporary file retained");
+        crate::debug_log!("download {}: local SHA-256 verified", journal.id);
+    } else {
+        ensure!(fs::metadata(&journal.temporary)?.len() == journal.size,
+            "downloaded file size differs; temporary file retained");
+        let metadata = control_sftp.metadata(&journal.source).await?;
+        let mtime = metadata.modified().ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|time| time.as_secs());
+        ensure!(metadata.len() == journal.size && mtime == journal.source_mtime,
+            "remote source changed during download; temporary file retained");
+    }
     let destination = Path::new(&journal.destination);
     fs::hard_link(&journal.temporary, destination)
         .context("cannot publish without overwriting destination")?;
@@ -1084,6 +1107,7 @@ mod tests {
             "complete": [false], "published": false
         })).unwrap();
         assert_eq!(journal.version, 0);
+        assert!(journal.verify);
         journal.worker_host = worker_host();
         journal.worker_pid = std::process::id();
         journal.updated_at_unix_ms = now_unix_ms();

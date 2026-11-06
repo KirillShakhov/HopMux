@@ -41,6 +41,8 @@ struct Cli {
     details: bool,
     #[arg(long)]
     debug: bool,
+    #[arg(long)]
+    verify: bool,
     #[arg(long, conflicts_with = "restart")]
     continue_partial: bool,
     #[arg(long, conflicts_with = "continue_partial")]
@@ -71,6 +73,7 @@ async fn run() -> Result<()> {
         ensure!(config.effective_routes().iter().any(|r| &r.name == name && !r.disabled), "unknown or disabled route: {name}");
     }
     config.route_filter = cli.routes.clone();
+    config.verify = cli.verify;
     debug_log!("selected routes: {}", if cli.routes.is_empty() { "all".to_owned() } else { cli.routes.join(", ") });
     if let Some(chunk_size) = &cli.chunk_size {
         if chunk_size.eq_ignore_ascii_case("auto") {
@@ -191,6 +194,7 @@ fn spawn_worker(cli: &Cli, config_path: &std::path::Path, action: PartialAction)
     if let Some(seconds) = cli.chunk_timeout { cmd.arg("--chunk-timeout").arg(seconds.to_string()); }
     if cli.recursive { cmd.arg("-r"); }
     if cli.debug { cmd.arg("--debug"); }
+    if cli.verify { cmd.arg("--verify"); }
     cmd.arg("--worker-action").arg(match action {
         PartialAction::Continue => "continue", PartialAction::Restart => "restart", PartialAction::New => "new",
     });
@@ -218,7 +222,7 @@ async fn show_transfers(config: &Config, target: &str, json: bool) -> Result<()>
     else {
         for j in journals {
             let done = j.complete.iter().filter(|&&x| x).count();
-            println!("{} {:?} {} -> {} {}/{} chunks{}", j.id, j.direction, j.source, j.destination, done, j.complete.len(), if j.published { " [done]" } else { " [partial]" });
+            println!("{} {:?} {} -> {} {}/{} chunks{}{}", j.id, j.direction, j.source, j.destination, done, j.complete.len(), if j.published { " [done]" } else { " [partial]" }, if j.verify { " [SHA-256]" } else { "" });
             if let Some(error) = &j.last_error { println!("  error: {error}"); }
             for (route, stats) in j.route_stats { println!("  {route}: {} bytes, batch {} bytes, connect {} ms, session {} ms, failed {} ms, errors {}, reconnects {}", stats.bytes, if stats.chosen_batch_size > 0 { stats.chosen_batch_size } else { j.batch_size.max(j.chunk_size) }, stats.connect_ms, stats.session_ms, stats.failed_session_ms, stats.errors, stats.reconnects); }
         }
@@ -261,7 +265,7 @@ async fn show_status(config: &Config, target: Option<&str>, json: bool, details:
         for (node, journals) in transfers {
             for j in journals {
                 let done = j.complete.iter().filter(|&&x| x).count();
-                println!("transfer {} on {}: {:?} {}/{} chunks{}", j.id, node, j.direction, done, j.complete.len(), if j.published { " [done]" } else { " [partial]" });
+                println!("transfer {} on {}: {:?} {}/{} chunks{}{}", j.id, node, j.direction, done, j.complete.len(), if j.published { " [done]" } else { " [partial]" }, if j.verify { " [SHA-256]" } else { "" });
                 if let Some(error) = &j.last_error { println!("  error: {error}"); }
                 if details {
                     for (route, stats) in j.route_stats { println!("  {route}: {} bytes, batch {} bytes, connect {} ms, session {} ms, failed {} ms, errors {}, reconnects {}", stats.bytes, if stats.chosen_batch_size > 0 { stats.chosen_batch_size } else { j.batch_size.max(j.chunk_size) }, stats.connect_ms, stats.session_ms, stats.failed_session_ms, stats.errors, stats.reconnects); }
@@ -294,6 +298,7 @@ mod tests {
         let detailed_status = Cli::try_parse_from(["mssh", "status", "edge_a", "--details"]).unwrap();
         assert!(detailed_status.details);
         assert!(!detailed_status.debug);
+        assert!(Cli::try_parse_from(["mssh", "--verify", "./a", "edge_a:/b"]).unwrap().verify);
         let tuned = Cli::try_parse_from(["mssh", "--chunk-size", "auto", "--min-chunk-size", "320KiB",
             "--max-chunk-size", "4MiB", "--route-chunk", "via-a=512KiB", "--chunk-timeout", "30",
             "./test.yml", "edge_a:/home"]).unwrap();

@@ -29,6 +29,8 @@ pub struct Config {
     pub chunk_timeout_secs: Option<u64>,
     #[serde(skip)]
     pub route_chunk_sizes: BTreeMap<String, usize>,
+    #[serde(skip)]
+    pub verify: bool,
 }
 
 fn default_auto_chunk() -> bool { true }
