@@ -108,7 +108,7 @@ async fn route_manager(
             next_route = (index + 1) % routes.len();
             delay = Duration::from_secs(1);
             crate::debug_log!("forward {}: ready {} -> {} -> {}:{}", binding.name, binding.listen,
-                output::route_chain(&live.route.hops), live.remote_host, live.remote_port);
+                output::route_label(&live.route), live.remote_host, live.remote_port);
             ready_tx.send_replace(Some(live.clone()));
             let mut checks = tokio::time::interval_at(Instant::now() + HEALTH_INTERVAL, HEALTH_INTERVAL);
             checks.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -197,7 +197,7 @@ async fn forward_client(
                 match result {
                     Ok(Ok(mut remote)) => {
                         crate::debug_log!("forward {}: {} -> {} -> {}:{}", binding.name, binding.listen,
-                            output::route_chain(&live.route.hops), live.remote_host, live.remote_port);
+                            output::route_label(&live.route), live.remote_host, live.remote_port);
                         return pipe(&mut client, &mut remote).await;
                     }
                     Ok(Err(error)) => Err(anyhow::Error::new(error)),
@@ -212,7 +212,7 @@ async fn forward_client(
                     Ok(Ok(channel)) => {
                         let mut remote = channel.into_stream();
                         crate::debug_log!("forward {}: {} -> {} -> {}:{}", binding.name, binding.listen,
-                            output::route_chain(&live.route.hops), live.remote_host, live.remote_port);
+                            output::route_label(&live.route), live.remote_host, live.remote_port);
                         return pipe(&mut client, &mut remote).await;
                     }
                     Ok(Err(error)) => Err(anyhow::Error::new(error)),

@@ -48,6 +48,7 @@ mssh --chunk-size auto --min-chunk-size 256KiB --max-chunk-size 8MiB edge_a:/dat
 mssh --route-chunk internal-2=512KiB --chunk-timeout 60 ./big.bin internal:/data/
 mssh status --json
 mssh config check
+mssh serve
 ```
 
 Copying to an existing directory appends the source name, as with `scp`. Remote paths must be absolute. Use `-r` for directories. All available routes are used for file transfers by default; `--route ID` selects a generated route ID such as `internal-1` and can be repeated. `--max-routes N` limits the number used concurrently.
@@ -67,6 +68,45 @@ File copies prioritize speed: uploads do not read back each chunk, and SHA-256 v
 `mssh TARGET` opens an SSH shell. It automatically uses `tmux` on the target when available, otherwise `screen`, otherwise a plain shell. `mssh` only checks for these programs; it never installs packages on the target. With `tmux` or `screen`, a route change reconnects to the same remote session, preserving running programs such as `nano`. A plain shell reconnects after a transport failure, but remote processes tied to the broken SSH channel cannot be preserved. Ctrl-] forces a reconnect.
 
 While a `tmux` or `screen` shell is open, `mssh` checks SSH round-trip time and the rate of a small echo probe on a separate channel. Two poor checks trigger a search through the other routes. It chooses the first route meeting the interactive thresholds, or a substantially better route if every route is slow; a slow route is still usable. The default thresholds are 2 seconds and 2048 bytes/s, checked every 30 seconds. `--shell-max-rtt-ms N`, `--shell-min-rate N` (bytes/s), and `--shell-check-interval N` (seconds, `0` to disable checks) adjust this behavior. `--shell-mode auto|tmux|screen|plain` overrides mode detection; `auto` is the default. `--debug` logs probe results and route decisions.
+
+## Local SSH and service ports
+
+Add `local_ssh_port` to a node to expose its SSH port on the client's loopback address. The node's existing `port` remains the SSH port on the remote host. Use `[forwards.NAME]` for other TCP services:
+
+```toml
+[nodes.internal]
+host = "10.0.0.15"
+port = 22
+user = "alice"
+key_file = "~/.ssh/id_ed25519"
+local_ssh_port = 2222
+
+[forwards.postgres]
+via = "internal"
+listen = "127.0.0.1:15432"
+remote = "127.0.0.1:5432"
+
+[forwards.metrics]
+via = "internal"
+listen = "127.0.0.1:19090"
+remote = "10.0.0.20:9090"
+```
+
+`via` selects the SSH node at the end of a configured path; `remote` is resolved from that node. `mssh serve` listens on every configured port in the foreground. For example, `ssh -p 2222 alice@127.0.0.1` reaches `internal`. Service forwards use SSH TCP forwarding on the final node; SSH-port bindings use the preceding hop to reach the final node's SSH port. No software is installed on remote hosts. `config check` rejects duplicate or overlapping local bindings and destinations without a route. Loopback is the only address used by `local_ssh_port`; a service `listen` address is explicit and may expose that service to other machines.
+
+The listeners remain open when routes fail. `mssh` checks the active route every five seconds, tries other configured routes in priority order, and retries with a one-to-30-second backoff when all are unavailable. A newly accepted client waits up to 45 seconds for a route. Already established TCP streams cannot migrate to another SSH route and will end if their route breaks; new streams use the recovered route.
+
+For automatic startup on Linux, install the binary and the included user service:
+
+```sh
+install -Dm755 target/release/mssh ~/.local/bin/mssh
+install -Dm644 packaging/systemd/mssh-forwards.service ~/.config/systemd/user/mssh-forwards.service
+systemctl --user daemon-reload
+systemctl --user enable --now mssh-forwards.service
+journalctl --user -u mssh-forwards.service -f
+```
+
+The user service runs `mssh serve` and restarts it after a process failure. It must be able to authenticate without a terminal; make the configured key, agent, or password environment available to the user service. To keep it running after logout and start it at boot before login, enable user lingering with `loginctl enable-linger "$USER"` where permitted. The service needs no network-online dependency because it binds local ports immediately and reconnects in the background.
 
 Human-readable status, SSH, transfer, progress, and debug messages show routes as chains, for example `target-5: local -> entry5 -> relay5 -> relay5b -> hub -> target`. With `--details`, each hop appears as `relay5 -> relay5b: connect=...ms`. JSON output keeps separate route and hop fields.
 
@@ -91,6 +131,7 @@ The RTT values are configured round trips for an individual link; actual `ping` 
 ```sh
 docker compose -f compose.test.yaml up -d --build --wait --wait-timeout 900
 python3 tests/compose-stand/check.py
+bash tests/compose-stand/forward.sh
 docker compose -f compose.test.yaml exec -T client mssh --config /data/config.toml status target --details
 docker compose -f compose.test.yaml exec -T client sh -c 'dd if=/dev/urandom of=/data/sample.bin bs=1M count=16 status=none && mssh --config /data/config.toml /data/sample.bin target:/home/mssh/data/sample.bin'
 docker compose -f compose.test.yaml exec -T client sha256sum /data/sample.bin
@@ -99,3 +140,5 @@ docker compose -f compose.test.yaml down
 ```
 
 For another copy, choose a new destination filename; `mssh` does not overwrite the previous result. The stand uses named volumes for its keys, client test data, build cache, and target's home directory. Use `docker compose -f compose.test.yaml down -v` to remove them, including transfer journals. The older `tests/local-stand.sh` remains available for Ubuntu WSL; run it as root with the ordinary Linux username, and use `tests/local-stand.sh stop` to stop it.
+
+The forward test builds the current client, checks an SSH-port binding and a service binding through five SSH hops, stops one route, then stops both selected routes and restores one. It verifies that the local listeners survive and new connections recover. It restores the stopped test nodes and ends the test forwarder when finished.
