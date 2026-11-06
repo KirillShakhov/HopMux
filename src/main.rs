@@ -43,6 +43,14 @@ struct Cli {
     details: bool,
     #[arg(long)]
     debug: bool,
+    #[arg(long, default_value = "auto", value_parser = ["auto", "tmux", "screen", "plain"])]
+    shell_mode: String,
+    #[arg(long, default_value_t = 2048)]
+    shell_min_rate: u64,
+    #[arg(long, default_value_t = 2000)]
+    shell_max_rtt_ms: u64,
+    #[arg(long, default_value_t = 30)]
+    shell_check_interval: u64,
     #[arg(long)]
     verify: bool,
     #[arg(long, conflicts_with = "restart")]
@@ -130,7 +138,22 @@ async fn run() -> Result<()> {
         [cmd, target] if cmd == "status" => show_status(&config, Some(target), cli.json, cli.details).await?,
         [target] if config.nodes.contains_key(target) => {
             debug_log!("opening SSH shell to {target}");
-            service::ssh(&config, target).await?
+            let preference = match cli.shell_mode.as_str() {
+                "tmux" => service::ShellPreference::Tmux,
+                "screen" => service::ShellPreference::Screen,
+                "plain" => service::ShellPreference::Plain,
+                _ => service::ShellPreference::Auto,
+            };
+            ensure!(cli.shell_min_rate <= 1024 * 1024, "shell-min-rate must be 0..=1048576 bytes/s");
+            ensure!((100..=60_000).contains(&cli.shell_max_rtt_ms), "shell-max-rtt-ms must be 100..=60000");
+            ensure!(cli.shell_check_interval <= 3600, "shell-check-interval must be 0..=3600 seconds");
+            let options = service::ShellOptions {
+                preference,
+                min_rate_bytes_per_sec: cli.shell_min_rate,
+                max_rtt: std::time::Duration::from_millis(cli.shell_max_rtt_ms),
+                check_interval: (cli.shell_check_interval > 0).then(|| std::time::Duration::from_secs(cli.shell_check_interval)),
+            };
+            service::ssh(&config, target, options).await?
         },
         [source, destination] => {
             debug_log!("preparing copy: {source} -> {destination}");

@@ -2,7 +2,7 @@ use crate::{config::{Config, Route}, terminal, transport, transfer, directory, o
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use std::{path::{Path, PathBuf}, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
-use tokio::{io::AsyncWriteExt, sync::Semaphore};
+use tokio::{io::AsyncWriteExt, sync::{Semaphore, oneshot}, time::MissedTickBehavior};
 
 #[derive(Serialize)]
 pub struct AuthStatus {
@@ -132,43 +132,269 @@ pub async fn probe_routes(config: &Config, target: Option<&str>) -> Vec<RouteSta
     statuses
 }
 
-pub async fn ssh(config: &Config, target: &str) -> Result<()> {
+pub async fn ssh(config: &Config, target: &str, options: ShellOptions) -> Result<()> {
     let mut routes = config.routes_for(target);
     if routes.is_empty() {
         bail!("no route to target {target}");
     }
     let mut index = 0;
+    let session_name = format!("mssh-{}", uuid::Uuid::new_v4().simple());
+    let mut mode = None;
+    let mut raw_terminal = None;
+    let mut stdin = None;
+    let mut selected_connection: Option<(Route, Arc<transport::Connection>)> = None;
     loop {
-        let route = routes[index % routes.len()].clone();
-        crate::debug_log!("SSH shell: trying route {} (attempt {})", output::route_label(&route), index + 1);
-        index += 1;
-        match transport::connect(config, &route).await {
-            Ok(connection) => {
-                eprintln!("connected via {} (Ctrl-] to reconnect)", output::route_label(&route));
-                match shell(&connection).await {
-                    Ok(true) => { crate::debug_log!("SSH shell: remote session ended normally"); return Ok(()) },
-                    Ok(false) => { crate::debug_log!("SSH shell: reconnect requested on {}", output::route_label(&route)); eprintln!("reconnecting {}...", output::route_label(&route)) },
-                    Err(error) => { crate::debug_log!("SSH shell: {} disconnected: {error:#}", output::route_label(&route)); eprintln!("shell disconnected on {}: {error:#}; reconnecting...", output::route_label(&route)) },
-                }
-            }
-            Err(error) => {
-                crate::debug_log!("SSH shell: route {} failed: {error:#}", output::route_label(&route));
-                eprintln!("route {} failed: {error:#}", output::route_label(&route));
-                if transport::is_permanent(&error) {
-                    routes.retain(|candidate| candidate.name != route.name);
-                    if routes.is_empty() {
-                        bail!(
-                            "all routes to {target} have permanent authentication or host-key errors"
-                        );
+        let (route, connection) = if let Some(selected) = selected_connection.take() {
+            selected
+        } else {
+            let route = routes[index % routes.len()].clone();
+            crate::debug_log!("SSH shell: trying route {} (attempt {})", output::route_label(&route), index + 1);
+            index += 1;
+            match transport::connect(config, &route).await {
+                Ok(connection) => (route, Arc::new(connection)),
+                Err(error) => {
+                    crate::debug_log!("SSH shell: route {} failed: {error:#}", output::route_label(&route));
+                    if transport::is_permanent(&error) {
+                        routes.retain(|candidate| candidate.name != route.name);
+                        if routes.is_empty() {
+                            bail!("all routes to {target} have permanent authentication or host-key errors");
+                        }
                     }
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    continue;
                 }
             }
-        }
+        };
+                let selected_mode = match mode {
+                    Some(mode) => mode,
+                    None => {
+                        let tmux = if matches!(options.preference, ShellPreference::Auto | ShellPreference::Tmux) {
+                            remote_command_ok(&connection, "command -v tmux >/dev/null 2>&1").await.unwrap_or(false)
+                        } else { false };
+                        let screen = if matches!(options.preference, ShellPreference::Screen)
+                            || matches!(options.preference, ShellPreference::Auto) && !tmux {
+                            remote_command_ok(&connection, "command -v screen >/dev/null 2>&1").await.unwrap_or(false)
+                        } else { false };
+                        let selected = choose_shell_mode(options.preference, tmux, screen);
+                        crate::debug_log!("SSH shell: server-side mode {selected:?}");
+                        mode = Some(selected);
+                        selected
+                    }
+                };
+                if raw_terminal.is_none() {
+                    raw_terminal = Some(RawTerminal::new()?);
+                    stdin = Some(terminal::Input::new()?);
+                }
+                crate::debug_log!("SSH shell: attached via {}", output::route_label(&route));
+                match shell(connection, selected_mode, &session_name, stdin.as_mut().unwrap(),
+                    config.clone(), routes.clone(), route.clone(), options).await {
+                    Ok(ShellEnd::InputEnded | ShellEnd::RemoteClosed { exited: true }) => {
+                        crate::debug_log!("SSH shell: remote session ended normally"); return Ok(());
+                    }
+                    Ok(ShellEnd::AutoSwitch(next_route, next_connection)) => {
+                        crate::debug_log!("SSH shell: switching {} -> {}", output::route_label(&route), output::route_label(&next_route));
+                        selected_connection = Some((next_route, next_connection));
+                        continue;
+                    }
+                    Ok(ShellEnd::ManualReconnect) => {
+                        crate::debug_log!("SSH shell: reconnect requested on {}", output::route_label(&route));
+                    }
+                    Ok(ShellEnd::RemoteClosed { exited: false }) => {
+                        crate::debug_log!("SSH shell: {} disconnected", output::route_label(&route));
+                    }
+                    Err(error) => { crate::debug_log!("SSH shell: {} disconnected: {error:#}", output::route_label(&route)); },
+                }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 }
 
-async fn shell(connection: &transport::Connection) -> Result<bool> {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ShellMode { Tmux, Screen, Plain }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShellPreference { Auto, Tmux, Screen, Plain }
+
+#[derive(Clone, Copy)]
+pub struct ShellOptions {
+    pub preference: ShellPreference,
+    pub min_rate_bytes_per_sec: u64,
+    pub max_rtt: Duration,
+    pub check_interval: Option<Duration>,
+}
+
+const INTERACTIVE_PROBE_BYTES: usize = 8192;
+
+#[derive(Clone, Copy, Debug)]
+struct InteractiveQuality {
+    rtt: Option<Duration>,
+    bytes_per_second: Option<u64>,
+}
+
+impl InteractiveQuality {
+    fn sufficient(self, options: ShellOptions) -> bool {
+        self.rtt.is_some_and(|rtt| rtt <= options.max_rtt)
+            && self.bytes_per_second.is_some_and(|rate| rate >= options.min_rate_bytes_per_sec)
+    }
+
+    fn score(self) -> u128 {
+        let rtt_ms = self.rtt.map_or(60_000, |rtt| rtt.as_millis());
+        let screen_ms = self.bytes_per_second.filter(|rate| *rate > 0)
+            .map_or(60_000, |rate| INTERACTIVE_PROBE_BYTES as u128 * 1000 / rate as u128);
+        rtt_ms.saturating_add(screen_ms)
+    }
+}
+
+fn better_shell_route(current: InteractiveQuality, candidate: InteractiveQuality, options: ShellOptions) -> bool {
+    if candidate.sufficient(options) { return true; }
+    candidate.score().saturating_mul(4) < current.score().saturating_mul(3)
+}
+
+type ShellSwitch = (Route, Arc<transport::Connection>);
+
+fn monitor_shell_route(
+    config: Config,
+    routes: Vec<Route>,
+    current_route: Route,
+    current_connection: Arc<transport::Connection>,
+    options: ShellOptions,
+    switch_tx: oneshot::Sender<ShellSwitch>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let interval = options.check_interval?;
+    Some(tokio::spawn(async move {
+        let mut ticks = tokio::time::interval(interval);
+        ticks.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut poor_samples = 0;
+        loop {
+            ticks.tick().await;
+            let current = measure_interactive_quality(&current_connection).await;
+            crate::debug_log!("SSH shell: quality {} RTT={:?} echo_rate={:?} B/s sufficient={}",
+                output::route_label(&current_route), current.rtt, current.bytes_per_second, current.sufficient(options));
+            if current.sufficient(options) {
+                poor_samples = 0;
+                continue;
+            }
+            poor_samples += 1;
+            if poor_samples < 2 { continue; }
+            poor_samples = 0;
+            let mut best: Option<(Route, Arc<transport::Connection>, InteractiveQuality)> = None;
+            for candidate in &routes {
+                if candidate.name == current_route.name { continue; }
+                match transport::connect(&config, candidate).await {
+                    Ok(connection) => {
+                        let connection = Arc::new(connection);
+                        let quality = measure_interactive_quality(&connection).await;
+                        crate::debug_log!("SSH shell: alternate quality {} RTT={:?} echo_rate={:?} B/s sufficient={}",
+                            output::route_label(candidate), quality.rtt, quality.bytes_per_second, quality.sufficient(options));
+                        if better_shell_route(current, quality, options) {
+                            if quality.sufficient(options) {
+                                let _ = switch_tx.send((candidate.clone(), connection));
+                                return;
+                            }
+                            if best.as_ref().is_none_or(|(_, _, previous)| quality.score() < previous.score()) {
+                                best = Some((candidate.clone(), connection, quality));
+                            }
+                        }
+                    }
+                    Err(error) => crate::debug_log!("SSH shell: alternate {} unavailable: {error:#}", output::route_label(candidate)),
+                }
+            }
+            if let Some((route, connection, _)) = best {
+                let _ = switch_tx.send((route, connection));
+                return;
+            }
+        }
+    }))
+}
+
+async fn measure_interactive_quality(connection: &transport::Connection) -> InteractiveQuality {
+    let started = Instant::now();
+    let rtt = match tokio::time::timeout(Duration::from_secs(8), connection.final_handle().send_ping()).await {
+        Ok(Ok(())) => Some(started.elapsed()),
+        _ => None,
+    };
+    let bytes_per_second = match probe_echo(connection).await {
+        Ok(elapsed) => Some((INTERACTIVE_PROBE_BYTES as u128 * 1000 / elapsed.as_millis().max(1)) as u64),
+        Err(error) => { crate::debug_log!("SSH shell: interactive echo probe failed: {error:#}"); None },
+    };
+    InteractiveQuality { rtt, bytes_per_second }
+}
+
+async fn probe_echo(connection: &transport::Connection) -> Result<Duration> {
+    let work = async {
+        let mut channel = connection.final_handle().channel_open_session().await?;
+        channel.exec(true, "cat").await?;
+        let started = Instant::now();
+        channel.data_bytes(vec![b'x'; INTERACTIVE_PROBE_BYTES]).await?;
+        channel.eof().await?;
+        let mut received = 0;
+        let mut status = None;
+        while let Some(message) = channel.wait().await {
+            match message {
+                russh::ChannelMsg::Data { data } => received += data.len(),
+                russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+                russh::ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        ensure!(received == INTERACTIVE_PROBE_BYTES && status == Some(0), "interactive echo probe incomplete");
+        Ok::<Duration, anyhow::Error>(started.elapsed())
+    };
+    tokio::time::timeout(Duration::from_secs(10), work).await.context("interactive echo probe timed out")?
+}
+
+fn choose_shell_mode(preference: ShellPreference, tmux_available: bool, screen_available: bool) -> ShellMode {
+    match preference {
+        ShellPreference::Auto | ShellPreference::Tmux if tmux_available => ShellMode::Tmux,
+        ShellPreference::Auto | ShellPreference::Screen if screen_available => ShellMode::Screen,
+        _ => ShellMode::Plain,
+    }
+}
+
+struct RawTerminal;
+
+impl RawTerminal {
+    fn new() -> Result<Self> {
+        crossterm::terminal::enable_raw_mode().context("cannot enable raw terminal")?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawTerminal {
+    fn drop(&mut self) { let _ = crossterm::terminal::disable_raw_mode(); }
+}
+
+async fn remote_command_ok(connection: &transport::Connection, command: &str) -> Result<bool> {
+    let work = async {
+        let mut channel = connection.final_handle().channel_open_session().await?;
+        channel.exec(true, command).await?;
+        let mut status = None;
+        while let Some(message) = channel.wait().await {
+            match message {
+                russh::ChannelMsg::ExitStatus { exit_status } => status = Some(exit_status),
+                russh::ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        Ok::<bool, anyhow::Error>(status == Some(0))
+    };
+    tokio::time::timeout(Duration::from_secs(10), work).await.context("remote command timed out")?
+}
+
+fn tmux_attach_command(session_name: &str) -> String {
+    format!("tmux -L {session_name} -f /dev/null new-session -d -s main 2>/dev/null || true; \
+        tmux -L {session_name} set-option -g status off >/dev/null 2>&1; \
+        tmux -L {session_name} set-option -g prefix None >/dev/null 2>&1; \
+        tmux -L {session_name} set-option -g escape-time 0 >/dev/null 2>&1; \
+        exec tmux -L {session_name} attach-session -d -t main")
+}
+
+fn screen_attach_command(session_name: &str) -> String {
+    format!("exec screen -c /dev/null -d -R -S {session_name}")
+}
+
+async fn shell(connection: Arc<transport::Connection>, mode: ShellMode, session_name: &str,
+    stdin: &mut terminal::Input, config: Config, routes: Vec<Route>, route: Route,
+    options: ShellOptions) -> Result<ShellEnd> {
     crate::debug_log!("SSH shell: opening session channel");
     let channel = connection.final_handle().channel_open_session().await?;
     let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
@@ -176,31 +402,37 @@ async fn shell(connection: &transport::Connection) -> Result<bool> {
     channel
         .request_pty(true, &term, cols as u32, rows as u32, 0, 0, &[])
         .await?;
-    channel.request_shell(true).await?;
-    crate::debug_log!("SSH shell: PTY requested, terminal {}x{}", cols, rows);
-    crossterm::terminal::enable_raw_mode().context("cannot enable raw terminal")?;
-    let result = shell_io(channel, (cols, rows)).await;
-    crossterm::terminal::disable_raw_mode()?;
-    match result? {
-        ShellEnd::InputEnded => Ok(true),
-        ShellEnd::ManualReconnect => Ok(false),
-        ShellEnd::RemoteClosed { exited } => Ok(exited),
+    match mode {
+        ShellMode::Tmux => channel.exec(true, tmux_attach_command(session_name)).await?,
+        ShellMode::Screen => channel.exec(true, screen_attach_command(session_name)).await?,
+        ShellMode::Plain => channel.request_shell(true).await?,
     }
+    crate::debug_log!("SSH shell: PTY requested, terminal {}x{}", cols, rows);
+    let (switch_tx, mut switch_rx) = oneshot::channel();
+    let monitor = if mode == ShellMode::Plain { None } else {
+        monitor_shell_route(config, routes, route, connection, options, switch_tx)
+    };
+    let result = shell_io(channel, (cols, rows), stdin, &mut switch_rx, monitor.is_some()).await;
+    if let Some(monitor) = monitor { monitor.abort(); }
+    result
 }
 
 enum ShellEnd {
     InputEnded,
     ManualReconnect,
+    AutoSwitch(Route, Arc<transport::Connection>),
     RemoteClosed { exited: bool },
 }
 
 async fn shell_io(
     channel: russh::Channel<russh::client::Msg>,
     mut size: (u16, u16),
+    stdin: &mut terminal::Input,
+    switch_rx: &mut oneshot::Receiver<ShellSwitch>,
+    mut monitor_enabled: bool,
 ) -> Result<ShellEnd> {
     let (mut remote_read, remote_write) = channel.split();
     let mut remote_input = remote_write.make_writer();
-    let mut stdin = terminal::Input::new()?;
     let mut stdout = tokio::io::stdout();
     let mut stderr = tokio::io::stderr();
     let mut input = [0u8; 4096];
@@ -208,6 +440,12 @@ async fn shell_io(
     let mut resize = tokio::time::interval(Duration::from_millis(500));
     loop {
         tokio::select! {
+            switch = &mut *switch_rx, if monitor_enabled => {
+                match switch {
+                    Ok((route, connection)) => return Ok(ShellEnd::AutoSwitch(route, connection)),
+                    Err(_) => monitor_enabled = false,
+                }
+            }
             count = stdin.read(&mut input) => {
                 let count = count?;
                 if count == 0 { return Ok(ShellEnd::InputEnded); }
@@ -336,5 +574,20 @@ pub async fn execute_copy(config: &Config, plan: CopyPlan, action: PartialAction
                 Ok(())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use super::*;
+
+    #[test]
+    fn chooses_installed_terminal_multiplexer_in_order() {
+        assert_eq!(choose_shell_mode(ShellPreference::Auto, true, true), ShellMode::Tmux);
+        assert_eq!(choose_shell_mode(ShellPreference::Auto, false, true), ShellMode::Screen);
+        assert_eq!(choose_shell_mode(ShellPreference::Auto, false, false), ShellMode::Plain);
+        assert_eq!(choose_shell_mode(ShellPreference::Screen, true, true), ShellMode::Screen);
+        assert_eq!(choose_shell_mode(ShellPreference::Tmux, false, true), ShellMode::Plain);
+        assert_eq!(choose_shell_mode(ShellPreference::Plain, true, true), ShellMode::Plain);
     }
 }

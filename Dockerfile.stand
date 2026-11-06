@@ -1,6 +1,6 @@
 FROM alpine:3.23
 
-RUN apk add --no-cache openssh-server iproute2 iputils \
+RUN apk add --no-cache openssh-server iproute2 iputils tmux screen nano \
     && adduser -D -h /home/mssh -s /bin/sh mssh \
     && passwd -d mssh \
     && mkdir -p /run/sshd /home/mssh/data \
