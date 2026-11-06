@@ -166,7 +166,7 @@ fn median_rate(stats: &RouteTransferStats, size: usize) -> Option<f64> {
     Some(rates[rates.len() / 2])
 }
 
-fn observe_batch(stats: &mut RouteTransferStats, size: usize, bytes: usize, elapsed: Duration, min: usize, max: usize) {
+fn observe_batch(stats: &mut RouteTransferStats, size: usize, bytes: usize, elapsed: Duration, min: usize, max: usize, timeout_secs: u64) {
     let elapsed_ms = elapsed.as_millis().saturating_add(std::mem::take(&mut stats.pending_connect_ms)).max(1);
     stats.observations.push(BatchObservation { size, bytes, elapsed_ms });
     let same_size = stats.observations.iter().filter(|sample| sample.size == size).count();
@@ -193,7 +193,10 @@ fn observe_batch(stats: &mut RouteTransferStats, size: usize, bytes: usize, elap
         stats.adaptive_max_size = smaller;
         stats.cooldown_batches = 4;
     } else if size < max.min(if stats.adaptive_max_size == 0 { max } else { stats.adaptive_max_size }) {
-        stats.chosen_batch_size = size.saturating_mul(2).min(max).min(if stats.adaptive_max_size == 0 { max } else { stats.adaptive_max_size });
+        let candidate = size.saturating_mul(2).min(max).min(if stats.adaptive_max_size == 0 { max } else { stats.adaptive_max_size });
+        if candidate as f64 / current <= timeout_secs as f64 * 0.8 {
+            stats.chosen_batch_size = candidate;
+        }
     }
 }
 
@@ -253,9 +256,10 @@ async fn note_failed_batch(shared: &Arc<Mutex<Journal>>, route: &str, selected_s
     if journal.adaptive {
         let min = journal.min_batch_size.max(journal.chunk_size);
         let max = journal.max_batch_size.max(min);
+        let timeout_secs = journal.chunk_timeout_secs.unwrap_or(120);
         let stats = journal.route_stats.entry(route.to_owned()).or_default();
         if !stats.fixed_batch_size {
-            observe_batch(stats, selected_size, 0, started.elapsed(), min, max);
+            observe_batch(stats, selected_size, 0, started.elapsed(), min, max, timeout_secs);
             crate::debug_log!("transfer {}: route {} batch failed; next size {} bytes", journal.id, route, route_batch_size(&journal, route));
         }
     }
@@ -267,9 +271,10 @@ async fn note_failed_connection(shared: &Arc<Mutex<Journal>>, route: &str, start
         let selected_size = route_batch_size(&journal, route);
         let min = journal.min_batch_size.max(journal.chunk_size);
         let max = journal.max_batch_size.max(min);
+        let timeout_secs = journal.chunk_timeout_secs.unwrap_or(120);
         let stats = journal.route_stats.entry(route.to_owned()).or_default();
         if !stats.fixed_batch_size {
-            observe_batch(stats, selected_size, 0, started.elapsed(), min, max);
+            observe_batch(stats, selected_size, 0, started.elapsed(), min, max, timeout_secs);
             crate::debug_log!("transfer {}: route {} connection failed after {} ms; next batch size {} bytes",
                 journal.id, route, started.elapsed().as_millis(), route_batch_size(&journal, route));
         }
@@ -315,9 +320,10 @@ async fn note_batch(
     if journal.adaptive && bytes >= selected_size {
         let min = journal.min_batch_size.max(journal.chunk_size);
         let max = journal.max_batch_size.max(min);
+        let timeout_secs = journal.chunk_timeout_secs.unwrap_or(120);
         let stats = journal.route_stats.entry(route.to_owned()).or_default();
         if !stats.fixed_batch_size {
-            observe_batch(stats, selected_size, bytes, started.elapsed(), min, max);
+            observe_batch(stats, selected_size, bytes, started.elapsed(), min, max, timeout_secs);
             crate::debug_log!("transfer {}: route {} next batch size {} bytes", journal.id, route, route_batch_size(&journal, route));
         }
     }
@@ -1084,12 +1090,12 @@ mod tests {
     fn adaptive_batches_use_medians_and_stop_after_a_slower_size() {
         let mib = 1024 * 1024;
         let mut stats = RouteTransferStats::default();
-        for _ in 0..3 { observe_batch(&mut stats, mib, mib, Duration::from_millis(100), 256 * 1024, 8 * mib); }
+        for _ in 0..3 { observe_batch(&mut stats, mib, mib, Duration::from_millis(100), 256 * 1024, 8 * mib, 120); }
         assert_eq!(stats.chosen_batch_size, 2 * mib);
-        for _ in 0..3 { observe_batch(&mut stats, 2 * mib, 2 * mib, Duration::from_millis(300), 256 * 1024, 8 * mib); }
+        for _ in 0..3 { observe_batch(&mut stats, 2 * mib, 2 * mib, Duration::from_millis(300), 256 * 1024, 8 * mib, 120); }
         assert_eq!(stats.chosen_batch_size, mib);
         assert_eq!(stats.adaptive_max_size, mib);
-        for _ in 0..10 { observe_batch(&mut stats, mib, mib, Duration::from_millis(100), 256 * 1024, 8 * mib); }
+        for _ in 0..10 { observe_batch(&mut stats, mib, mib, Duration::from_millis(100), 256 * 1024, 8 * mib, 120); }
         assert_eq!(stats.chosen_batch_size, mib);
     }
 
@@ -1097,12 +1103,12 @@ mod tests {
     fn one_failure_does_not_shrink_but_two_do() {
         let mib = 1024 * 1024;
         let mut stats = RouteTransferStats { chosen_batch_size: 2 * mib, ..Default::default() };
-        observe_batch(&mut stats, 2 * mib, 0, Duration::from_millis(500), 256 * 1024, 8 * mib);
+        observe_batch(&mut stats, 2 * mib, 0, Duration::from_millis(500), 256 * 1024, 8 * mib, 120);
         assert_eq!(stats.chosen_batch_size, 2 * mib);
-        observe_batch(&mut stats, 2 * mib, 2 * mib, Duration::from_millis(100), 256 * 1024, 8 * mib);
+        observe_batch(&mut stats, 2 * mib, 2 * mib, Duration::from_millis(100), 256 * 1024, 8 * mib, 120);
         assert_eq!(stats.consecutive_failures, 0);
-        observe_batch(&mut stats, 2 * mib, 0, Duration::from_millis(500), 256 * 1024, 8 * mib);
-        observe_batch(&mut stats, 2 * mib, 0, Duration::from_millis(500), 256 * 1024, 8 * mib);
+        observe_batch(&mut stats, 2 * mib, 0, Duration::from_millis(500), 256 * 1024, 8 * mib, 120);
+        observe_batch(&mut stats, 2 * mib, 0, Duration::from_millis(500), 256 * 1024, 8 * mib, 120);
         assert_eq!(stats.chosen_batch_size, mib);
     }
 
@@ -1110,9 +1116,24 @@ mod tests {
     fn connection_time_is_part_of_first_batch_observation() {
         let mib = 1024 * 1024;
         let mut stats = RouteTransferStats { pending_connect_ms: 250, ..Default::default() };
-        observe_batch(&mut stats, mib, mib, Duration::from_millis(100), 256 * 1024, 8 * mib);
+        observe_batch(&mut stats, mib, mib, Duration::from_millis(100), 256 * 1024, 8 * mib, 120);
         assert_eq!(stats.observations[0].elapsed_ms, 350);
         assert_eq!(stats.pending_connect_ms, 0);
+    }
+
+    #[test]
+    fn auto_size_respects_batch_timeout() {
+        let mib = 1024 * 1024;
+        let mut slow = RouteTransferStats { chosen_batch_size: 4 * mib, ..Default::default() };
+        for _ in 0..3 {
+            observe_batch(&mut slow, 4 * mib, 4 * mib, Duration::from_secs(70), 256 * 1024, 8 * mib, 120);
+        }
+        assert_eq!(slow.chosen_batch_size, 4 * mib);
+        let mut fast = RouteTransferStats { chosen_batch_size: 4 * mib, ..Default::default() };
+        for _ in 0..3 {
+            observe_batch(&mut fast, 4 * mib, 4 * mib, Duration::from_secs(20), 256 * 1024, 8 * mib, 120);
+        }
+        assert_eq!(fast.chosen_batch_size, 8 * mib);
     }
 
     #[cfg(unix)]
