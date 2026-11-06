@@ -53,6 +53,8 @@ File copies prioritize speed: uploads do not read back each chunk, and SHA-256 v
 
 `status` probes routes and displays connection times, SSH round-trip times, hop timings with `--details`, and transfer progress from remote journals. `status --details` and `transfers TARGET` show the current batch size and route timing. `config check` validates the configuration. `mssh TARGET` opens an SSH shell and reconnects after a transport failure; Ctrl-] forces a reconnect.
 
+Human-readable status, SSH, transfer, progress, and debug messages show routes as chains, for example `path5: local -> entry5 -> relay5 -> relay5b -> hub -> target`. With `--details`, each hop appears as `relay5 -> relay5b: connect=...ms`. JSON output keeps separate route and hop fields.
+
 ## Limits
 
 Background transfers need the client computer to stay running. A partial download can be continued only where its local `.part` file is available; on another computer it must be restarted. Remote state requires write access to the SSH account's home directory. Recursive directory copies cannot yet continue as one operation after an interruption; individual files have remote journals. SSH host certificates are rejected until CA and principal validation are configured.
