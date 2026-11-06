@@ -4,6 +4,23 @@ set -eu
 mkdir -p /data
 config=/data/config.toml
 cat > "$config" <<'EOF'
+direct_hosts = ["entry1", "entry2", "entry3", "entry4", "entry5"]
+paths = [
+  ["entry1", "relay1"],
+  ["relay1", "hub"],
+  ["entry2", "relay2"],
+  ["relay2", "hub"],
+  ["entry3", "relay3"],
+  ["relay3", "hub"],
+  ["entry4", "relay4"],
+  ["relay4", "relay4b"],
+  ["relay4b", "hub"],
+  ["entry5", "relay5"],
+  ["relay5", "relay5b"],
+  ["relay5b", "hub"],
+  ["hub", "target"],
+]
+
 [settings]
 connect_timeout_secs = 20
 check_interval_secs = 10
@@ -20,22 +37,6 @@ host = "$node"
 user = "mssh"
 host_key = "$pin"
 key_file = "/keys/client"
-EOF
-done
-
-for i in 1 2 3 4 5; do
-    if [ "$i" -le 3 ]; then
-        hops="\"entry$i\", \"relay$i\", \"hub\", \"target\""
-    else
-        hops="\"entry$i\", \"relay$i\", \"relay${i}b\", \"hub\", \"target\""
-    fi
-    cat >> "$config" <<EOF
-
-[[routes]]
-name = "path$i"
-target = "target"
-hops = [$hops]
-priority = $i
 EOF
 done
 chmod 600 "$config"

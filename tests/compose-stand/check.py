@@ -108,13 +108,14 @@ def main():
         "/data/config.toml", "status", "target", "--json",
     ))
     routes = {route["route"]: route for route in report["routes"]}
-    assert set(routes) == {f"path{i}" for i in range(1, 6)}, routes.keys()
+    assert set(routes) == {f"target-{i}" for i in range(1, 6)}, routes.keys()
     for i in range(1, 6):
-        route = routes[f"path{i}"]
+        route = routes[f"target-{i}"]
         expected_hops = 4 if i <= 3 else 5
         assert route["state"] == "UP", route
         assert len(route["hop_timings"]) == expected_hops, route
-        print(f"path{i}: UP, {expected_hops} SSH hops")
+        assert route["hops"][0] == f"entry{i}", route
+        print(f"target-{i}: UP, {expected_hops} SSH hops")
 
 
 if __name__ == "__main__":
