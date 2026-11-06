@@ -222,34 +222,36 @@ async fn note_session(shared: &Arc<Mutex<Journal>>, route: &str, connect: Durati
 
 async fn note_worker_finished(
     shared: &Arc<Mutex<Journal>>,
+    save_lock: &Arc<Mutex<()>>,
     route: &str,
     elapsed: Duration,
     failed: bool,
     sftp: &SftpSession,
     config: &Config,
 ) -> Result<()> {
-    let mut journal = shared.lock().await;
-    journal.updated_at_unix_ms = now_unix_ms();
-    let stats = journal.route_stats.entry(route.to_owned()).or_default();
-    stats.session_ms = stats.session_ms.saturating_add(elapsed.as_millis());
-    if failed {
-        stats.failed_session_ms = stats.failed_session_ms.saturating_add(elapsed.as_millis());
+    {
+        let mut journal = shared.lock().await;
+        journal.updated_at_unix_ms = now_unix_ms();
+        let stats = journal.route_stats.entry(route.to_owned()).or_default();
+        stats.session_ms = stats.session_ms.saturating_add(elapsed.as_millis());
+        if failed {
+            stats.failed_session_ms = stats.failed_session_ms.saturating_add(elapsed.as_millis());
+        }
+        crate::debug_log!("transfer {}: route {} session ended after {} ms, failed={failed}", journal.id, route, elapsed.as_millis());
     }
-    crate::debug_log!("transfer {}: route {} session ended after {} ms, failed={failed}", journal.id, route, elapsed.as_millis());
-    save_with_reconnect(sftp, config, &journal).await?;
-    journal.uncheckpointed_bytes = 0;
-    journal.checkpoint_at = Instant::now();
-    Ok(())
+    save_shared(shared, save_lock, sftp, Some(config), true).await
 }
 
-async fn note_error(shared: &Arc<Mutex<Journal>>, route: &str, error: &anyhow::Error, sftp: &SftpSession, config: &Config) -> Result<()> {
-    let mut journal = shared.lock().await;
-    journal.updated_at_unix_ms = now_unix_ms();
-    let stats = journal.route_stats.entry(route.to_owned()).or_default();
-    stats.errors = stats.errors.saturating_add(1);
-    journal.last_error = Some(format!("{error:#}"));
-    crate::debug_log!("transfer {}: route {} error: {error:#}", journal.id, route);
-    save_with_reconnect(sftp, config, &journal).await
+async fn note_error(shared: &Arc<Mutex<Journal>>, save_lock: &Arc<Mutex<()>>, route: &str, error: &anyhow::Error, sftp: &SftpSession, config: &Config) -> Result<()> {
+    {
+        let mut journal = shared.lock().await;
+        journal.updated_at_unix_ms = now_unix_ms();
+        let stats = journal.route_stats.entry(route.to_owned()).or_default();
+        stats.errors = stats.errors.saturating_add(1);
+        journal.last_error = Some(format!("{error:#}"));
+        crate::debug_log!("transfer {}: route {} error: {error:#}", journal.id, route);
+    }
+    save_shared(shared, save_lock, sftp, Some(config), true).await
 }
 
 async fn note_failed_batch(shared: &Arc<Mutex<Journal>>, route: &str, selected_size: usize, started: Instant) {
@@ -288,6 +290,7 @@ fn retry_route(error: &anyhow::Error, attempts: u32) -> bool {
 
 async fn note_batch(
     shared: &Arc<Mutex<Journal>>,
+    save_lock: &Arc<Mutex<()>>,
     sftp: &SftpSession,
     route: &str,
     indices: &[usize],
@@ -313,11 +316,7 @@ async fn note_batch(
     stats.last_at_unix_ms = now_unix_ms();
     crate::debug_log!("transfer {}: atoms {}..={} offset={} bytes={} route={} elapsed={} ms committed", journal.id, indices[0], indices[indices.len() - 1], indices[0] as u64 * journal.chunk_size as u64, bytes, route, elapsed.as_millis());
     journal.uncheckpointed_bytes = journal.uncheckpointed_bytes.saturating_add(bytes as u64);
-    if journal.uncheckpointed_bytes >= CHECKPOINT_BYTES || journal.checkpoint_at.elapsed() >= CHECKPOINT_INTERVAL {
-        save(sftp, &journal).await?;
-        journal.uncheckpointed_bytes = 0;
-        journal.checkpoint_at = Instant::now();
-    }
+    let checkpoint = journal.uncheckpointed_bytes >= CHECKPOINT_BYTES || journal.checkpoint_at.elapsed() >= CHECKPOINT_INTERVAL;
     if journal.adaptive && bytes >= selected_size {
         let min = journal.min_batch_size.max(journal.chunk_size);
         let max = journal.max_batch_size.max(min);
@@ -335,6 +334,33 @@ async fn note_batch(
         journal.complete.len(),
         route
     ));
+    drop(journal);
+    if checkpoint { save_shared(shared, save_lock, sftp, None, false).await?; }
+    Ok(())
+}
+
+async fn save_shared(
+    shared: &Arc<Mutex<Journal>>,
+    save_lock: &Arc<Mutex<()>>,
+    sftp: &SftpSession,
+    config: Option<&Config>,
+    force: bool,
+) -> Result<()> {
+    let _save_guard = save_lock.lock().await;
+    let snapshot = {
+        let journal = shared.lock().await;
+        if !force && journal.uncheckpointed_bytes < CHECKPOINT_BYTES && journal.checkpoint_at.elapsed() < CHECKPOINT_INTERVAL {
+            return Ok(());
+        }
+        journal.clone()
+    };
+    match config {
+        Some(config) => save_with_reconnect(sftp, config, &snapshot).await?,
+        None => save(sftp, &snapshot).await?,
+    }
+    let mut journal = shared.lock().await;
+    journal.uncheckpointed_bytes = journal.uncheckpointed_bytes.saturating_sub(snapshot.uncheckpointed_bytes);
+    journal.checkpoint_at = Instant::now();
     Ok(())
 }
 
@@ -685,6 +711,7 @@ async fn process_put(
     ensure!(!routes.is_empty(), "no route to target {}", journal.target);
     crate::debug_log!("upload {}: using routes {}", journal.id, routes.iter().map(|route| route.name.as_str()).collect::<Vec<_>>().join(", "));
     let shared = Arc::new(Mutex::new(journal.clone()));
+    let save_lock = Arc::new(Mutex::new(()));
     let config = Arc::new(config.clone());
     let mut failures = BTreeMap::<String, u32>::new();
     loop {
@@ -709,21 +736,22 @@ async fn process_put(
         for route in routes.iter().cloned() {
             let config = config.clone();
             let shared = shared.clone();
+            let save_lock = save_lock.clone();
             let queue = queue.clone();
             workers.spawn(async move {
                 let name = route.name.clone();
                 let started = Instant::now();
-                let result = put_worker(config, route, shared, queue).await;
+                let result = put_worker(config, route, shared, save_lock, queue).await;
                 (name, started.elapsed(), result)
             });
         }
         let mut failed = Vec::new();
         while let Some(result) = workers.join_next().await {
             let (name, elapsed, outcome) = result?;
-            note_worker_finished(&shared, &name, elapsed, outcome.is_err(), control_sftp, &config).await?;
+            note_worker_finished(&shared, &save_lock, &name, elapsed, outcome.is_err(), control_sftp, &config).await?;
             if let Err(error) = outcome {
                 crate::debug::write_stderr(format_args!("route {name}: {error:#}"));
-                note_error(&shared, &name, &error, control_sftp, &config).await?;
+                note_error(&shared, &save_lock, &name, &error, control_sftp, &config).await?;
                 let attempts = failures.entry(name.clone()).or_default();
                 *attempts += 1;
                 if !retry_route(&error, *attempts) {
@@ -774,6 +802,7 @@ async fn put_worker(
     config: Arc<Config>,
     route: Route,
     shared: Arc<Mutex<Journal>>,
+    save_lock: Arc<Mutex<()>>,
     queue: Arc<Mutex<VecDeque<usize>>>,
 ) -> Result<()> {
     let connect_started = Instant::now();
@@ -817,7 +846,7 @@ async fn put_worker(
                 anyhow::bail!("batch starting at atom {} exceeded {} second timeout", group[0], snapshot.chunk_timeout_secs.unwrap_or(120));
             }
         }
-        note_batch(&shared, &sftp, &route.name, &group, length, selected_size, chunk_started).await?;
+        note_batch(&shared, &save_lock, &sftp, &route.name, &group, length, selected_size, chunk_started).await?;
     }
     Ok(())
 }
@@ -937,6 +966,7 @@ async fn process_get(config: &Config, journal: &mut Journal, control_sftp: &Sftp
         "local temporary file is missing"
     );
     let shared = Arc::new(Mutex::new(journal.clone()));
+    let save_lock = Arc::new(Mutex::new(()));
     let config = Arc::new(config.clone());
     let mut failures = BTreeMap::<String, u32>::new();
     loop {
@@ -961,21 +991,22 @@ async fn process_get(config: &Config, journal: &mut Journal, control_sftp: &Sftp
         for route in routes.iter().cloned() {
             let config = config.clone();
             let shared = shared.clone();
+            let save_lock = save_lock.clone();
             let queue = queue.clone();
             workers.spawn(async move {
                 let name = route.name.clone();
                 let started = Instant::now();
-                let result = get_worker(config, route, shared, queue).await;
+                let result = get_worker(config, route, shared, save_lock, queue).await;
                 (name, started.elapsed(), result)
             });
         }
         let mut failed = Vec::new();
         while let Some(result) = workers.join_next().await {
             let (name, elapsed, outcome) = result?;
-            note_worker_finished(&shared, &name, elapsed, outcome.is_err(), control_sftp, &config).await?;
+            note_worker_finished(&shared, &save_lock, &name, elapsed, outcome.is_err(), control_sftp, &config).await?;
             if let Err(error) = outcome {
                 crate::debug::write_stderr(format_args!("route {name}: {error:#}"));
-                note_error(&shared, &name, &error, control_sftp, &config).await?;
+                note_error(&shared, &save_lock, &name, &error, control_sftp, &config).await?;
                 let attempts = failures.entry(name.clone()).or_default();
                 *attempts += 1;
                 if !retry_route(&error, *attempts) {
@@ -1021,6 +1052,7 @@ async fn get_worker(
     config: Arc<Config>,
     route: Route,
     shared: Arc<Mutex<Journal>>,
+    save_lock: Arc<Mutex<()>>,
     queue: Arc<Mutex<VecDeque<usize>>>,
 ) -> Result<()> {
     let connect_started = Instant::now();
@@ -1077,7 +1109,7 @@ async fn get_worker(
                 anyhow::bail!("batch starting at atom {} exceeded {} second timeout", group[0], snapshot.chunk_timeout_secs.unwrap_or(120));
             }
         }
-        note_batch(&shared, &sftp, &route.name, &group, length, selected_size, chunk_started).await?;
+        note_batch(&shared, &save_lock, &sftp, &route.name, &group, length, selected_size, chunk_started).await?;
     }
     remote.close().await?;
     Ok(())
