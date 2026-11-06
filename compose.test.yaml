@@ -12,7 +12,7 @@ x-sshd: &sshd
     keys:
       condition: service_completed_successfully
   healthcheck:
-    test: ["CMD", "nc", "-z", "127.0.0.1", "22"]
+    test: ["CMD-SHELL", "ss -ltn | grep -q ':22 '"]
     interval: 5s
     timeout: 2s
     retries: 15
