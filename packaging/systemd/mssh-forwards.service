@@ -1,0 +1,11 @@
+[Unit]
+Description=mssh local SSH and TCP forwards
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/mssh serve
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

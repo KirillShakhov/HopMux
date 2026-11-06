@@ -16,6 +16,8 @@ pub struct Config {
     #[serde(default)]
     pub nodes: BTreeMap<String, Node>,
     #[serde(default)]
+    pub forwards: BTreeMap<String, Forward>,
+    #[serde(default)]
     pub direct_hosts: Vec<String>,
     #[serde(default)]
     pub paths: Vec<Vec<String>>,
@@ -82,6 +84,7 @@ pub struct Node {
     pub host: String,
     #[serde(default = "default_port")]
     pub port: u16,
+    pub local_ssh_port: Option<u16>,
     pub user: String,
     pub host_key: Option<String>,
     pub key_file: Option<String>,
@@ -91,6 +94,28 @@ pub struct Node {
     pub password: Option<String>,
     #[serde(default)]
     pub agent: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Forward {
+    pub via: String,
+    pub listen: String,
+    pub remote: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BindingDestination {
+    Ssh,
+    Service { host: String, port: u16 },
+}
+
+#[derive(Debug, Clone)]
+pub struct PortBinding {
+    pub name: String,
+    pub via: String,
+    pub listen: std::net::SocketAddr,
+    pub destination: BindingDestination,
 }
 
 impl std::fmt::Debug for Node {
@@ -111,6 +136,20 @@ impl std::fmt::Debug for Node {
 }
 fn default_port() -> u16 {
     22
+}
+
+fn split_host_port(value: &str) -> Result<(String, u16)> {
+    let (host, port) = value.rsplit_once(':').context("expected HOST:PORT")?;
+    let host = if host.starts_with('[') && host.ends_with(']') {
+        &host[1..host.len() - 1]
+    } else {
+        ensure!(!host.contains(':'), "IPv6 addresses must be bracketed");
+        host
+    };
+    ensure!(!host.is_empty() && !host.chars().any(char::is_whitespace), "host is empty or contains whitespace");
+    let port = port.parse::<u16>().context("invalid port")?;
+    ensure!(port > 0, "port must be positive");
+    Ok((host.to_owned(), port))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -173,6 +212,9 @@ impl Config {
                     "duplicate node {id}"
                 );
             }
+            for (name, forward) in child.forwards {
+                ensure!(config.forwards.insert(name.clone(), forward).is_none(), "duplicate forward {name}");
+            }
             for route in child.routes {
                 config.routes.push(route);
             }
@@ -201,6 +243,8 @@ impl Config {
                 !id.is_empty() && !node.host.is_empty() && !node.user.is_empty(),
                 "node {id}: id, host and user are required"
             );
+            ensure!(node.port > 0 && node.local_ssh_port.is_none_or(|port| port > 0),
+                "node {id}: SSH ports must be positive");
             if let Some(host_key) = &node.host_key {
                 ensure!(
                     host_key.starts_with("SHA256:")
@@ -262,6 +306,7 @@ impl Config {
                 ensure!(path.iter().all(|host| reachable.contains(host.as_str())),
                     "configured path contains a host unreachable from direct_hosts: {}", path.join(" -> "));
             }
+            self.bindings()?;
             return Ok(());
         }
         let mut names = BTreeSet::new();
@@ -301,7 +346,48 @@ impl Config {
         if self.effective_routes().iter().all(|r| r.disabled) {
             bail!("all routes are disabled");
         }
+        self.bindings()?;
         Ok(())
+    }
+
+    pub fn bindings(&self) -> Result<Vec<PortBinding>> {
+        let mut bindings = Vec::new();
+        for (node, settings) in &self.nodes {
+            if let Some(port) = settings.local_ssh_port {
+                bindings.push(PortBinding {
+                    name: format!("ssh:{node}"), via: node.clone(),
+                    listen: format!("127.0.0.1:{port}").parse()?,
+                    destination: BindingDestination::Ssh,
+                });
+            }
+        }
+        for (name, forward) in &self.forwards {
+            ensure!(!name.is_empty(), "forward name must not be empty");
+            ensure!(self.nodes.contains_key(&forward.via), "forward {name}: unknown node {}", forward.via);
+            let listen = forward.listen.parse::<std::net::SocketAddr>()
+                .with_context(|| format!("forward {name}: listen must be an IP address and port"))?;
+            ensure!(listen.port() > 0, "forward {name}: listen port must be positive");
+            let (host, port) = split_host_port(&forward.remote)
+                .with_context(|| format!("forward {name}: invalid remote address"))?;
+            bindings.push(PortBinding {
+                name: name.clone(), via: forward.via.clone(), listen,
+                destination: BindingDestination::Service { host, port },
+            });
+        }
+        for (index, binding) in bindings.iter().enumerate() {
+            ensure!(!self.routes_for(&binding.via).is_empty(),
+                "binding {}: no route to {}", binding.name, binding.via);
+            for previous in &bindings[..index] {
+                if previous.listen.port() == binding.listen.port()
+                    && previous.listen.is_ipv4() == binding.listen.is_ipv4()
+                    && (previous.listen.ip() == binding.listen.ip()
+                        || previous.listen.ip().is_unspecified()
+                        || binding.listen.ip().is_unspecified()) {
+                    bail!("bindings {} and {} overlap on local port {}", previous.name, binding.name, binding.listen.port());
+                }
+            }
+        }
+        Ok(bindings)
     }
 
     /// Nodes without a configured route can be reached directly. Explicit
@@ -356,6 +442,38 @@ pub fn default_path() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn binds_ssh_and_services_through_discovered_routes() {
+        let mut config = graph_sample();
+        config.nodes.get_mut("target").unwrap().local_ssh_port = Some(2222);
+        config.forwards.insert("postgres".into(), Forward {
+            via: "target".into(), listen: "127.0.0.1:15432".into(),
+            remote: "127.0.0.1:5432".into(),
+        });
+        config.validate().unwrap();
+        let bindings = config.bindings().unwrap();
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(bindings[0].name, "ssh:target");
+        assert_eq!(bindings[0].listen.port(), 2222);
+        assert_eq!(bindings[1].destination, BindingDestination::Service {
+            host: "127.0.0.1".into(), port: 5432,
+        });
+        assert_eq!(config.routes_for(&bindings[0].via).len(), 2);
+    }
+
+    #[test]
+    fn rejects_overlapping_listeners_and_unreachable_via() {
+        let mut config = graph_sample();
+        config.nodes.get_mut("target").unwrap().local_ssh_port = Some(2222);
+        config.forwards.insert("duplicate".into(), Forward {
+            via: "target".into(), listen: "0.0.0.0:2222".into(), remote: "127.0.0.1:80".into(),
+        });
+        assert!(config.validate().unwrap_err().to_string().contains("overlap"));
+        config.forwards.get_mut("duplicate").unwrap().listen = "127.0.0.1:18080".into();
+        config.forwards.get_mut("duplicate").unwrap().via = "missing".into();
+        assert!(config.validate().unwrap_err().to_string().contains("unknown node"));
+    }
 
     fn graph_sample() -> Config {
         toml::from_str(r#"

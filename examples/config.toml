@@ -28,3 +28,9 @@ agent = true
 host = "10.0.0.15"
 user = "alice"
 password = "REPLACE_WITH_PASSWORD"
+local_ssh_port = 2222 # 127.0.0.1:2222 -> SSH on internal
+
+[forwards.internal_web]
+via = "internal"
+listen = "127.0.0.1:18080"
+remote = "127.0.0.1:8080"
