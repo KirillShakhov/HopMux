@@ -3,6 +3,7 @@ use crate::{
     transport,
 };
 use anyhow::{Context, Result, ensure};
+use russh::ChannelMsg;
 use russh_sftp::{client::SftpSession, protocol::{FileAttributes, OpenFlags}};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -459,6 +460,63 @@ pub(crate) async fn connect_any(config: &Config, target: &str) -> Result<transpo
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no route to target {target}")))
 }
 
+fn shell_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
+
+async fn remote_hash_command(connection: &transport::Connection, path: &str) -> Result<String> {
+    let work = async {
+        let mut channel = connection.final_handle().channel_open_session().await?;
+        channel.exec(true, format!("sha256sum -- {}", shell_quote(path))).await?;
+        let mut output = Vec::new();
+        let mut exit_status = None;
+        while let Some(message) = channel.wait().await {
+            match message {
+                ChannelMsg::Data { data } => {
+                    ensure!(output.len() + data.len() <= 8192, "remote SHA-256 output is too long");
+                    output.extend_from_slice(&data);
+                }
+                ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
+                ChannelMsg::Close => break,
+                _ => {}
+            }
+        }
+        ensure!(exit_status == Some(0), "remote SHA-256 command failed");
+        let output = std::str::from_utf8(&output)?;
+        let digest = output.split_whitespace().next().context("remote SHA-256 output is empty")?;
+        ensure!(digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "remote SHA-256 output is invalid");
+        Ok::<String, anyhow::Error>(digest.to_ascii_lowercase())
+    };
+    tokio::time::timeout(Duration::from_secs(3600), work).await.context("remote SHA-256 command timed out")?
+}
+
+async fn remote_hash_sftp(sftp: &SftpSession, path: &str, buffer_size: usize) -> Result<String> {
+    let mut remote = sftp.open(path).await?;
+    let mut hash = Sha256::new();
+    let mut buffer = vec![0u8; buffer_size.min(1024 * 1024)];
+    loop {
+        let n = remote.read(&mut buffer).await?;
+        if n == 0 { break; }
+        hash.update(&buffer[..n]);
+    }
+    remote.close().await?;
+    Ok(hex::encode(hash.finalize()))
+}
+
+async fn remote_hash(connection: &transport::Connection, sftp: &SftpSession, path: &str, buffer_size: usize) -> Result<String> {
+    match remote_hash_command(connection, path).await {
+        Ok(digest) => {
+            crate::debug_log!("hash: computed remote SHA-256 on server for {path}");
+            Ok(digest)
+        }
+        Err(error) => {
+            crate::debug_log!("hash: remote SHA-256 command unavailable ({error:#}); reading {path} over SFTP");
+            remote_hash_sftp(sftp, path, buffer_size).await
+        }
+    }
+}
+
 async fn local_hash(path: &Path) -> Result<(u64, String, Option<u64>)> {
     crate::debug_log!("hash: reading local file {}", path.display());
     let mut file = tokio::fs::File::open(path).await?;
@@ -630,20 +688,9 @@ async fn process_put(config: &Config, journal: &mut Journal) -> Result<()> {
     *journal = shared.lock().await.clone();
     let connection = connect_any(&config, &journal.target).await?;
     let sftp = sftp(&connection).await?;
-    let mut remote = sftp.open(&journal.temporary).await?;
-    let mut hash = Sha256::new();
-    let mut buffer = vec![0u8; journal.chunk_size.min(1024 * 1024)];
-    loop {
-        let count = remote.read(&mut buffer).await?;
-        if count == 0 {
-            break;
-        }
-        hash.update(&buffer[..count]);
-    }
-    remote.close().await?;
-    crate::debug_log!("upload {}: full remote part read for SHA-256 verification", journal.id);
+    let digest = remote_hash(&connection, &sftp, &journal.temporary, journal.chunk_size).await?;
     ensure!(
-        hex::encode(hash.finalize()) == journal.sha256,
+        digest == journal.sha256,
         "remote SHA-256 differs; temporary file retained"
     );
     crate::debug_log!("upload {}: remote SHA-256 verified", journal.id);
@@ -768,18 +815,8 @@ pub async fn get(config: &Config, target: &str, source: &str, destination: &Path
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|t| t.as_secs());
-    let mut remote = sftp.open(source).await?;
-    let mut hash = Sha256::new();
-    let mut buffer = vec![0u8; config.settings.chunk_size.min(1024 * 1024)];
-    loop {
-        let n = remote.read(&mut buffer).await?;
-        if n == 0 {
-            break;
-        }
-        hash.update(&buffer[..n]);
-    }
-    remote.close().await?;
-    crate::debug_log!("download: source size={size} bytes, SHA-256 {}", hex::encode(hash.clone().finalize()));
+    let sha256 = remote_hash(&connection, &sftp, source, config.settings.chunk_size).await?;
+    crate::debug_log!("download: source size={size} bytes, SHA-256 {sha256}");
     let id = Uuid::new_v4();
     let atom_size = atom_size(config);
     let initial_batch_size = if config.auto_chunk {
@@ -805,7 +842,7 @@ pub async fn get(config: &Config, target: &str, source: &str, destination: &Path
         temporary,
         size,
         source_mtime,
-        sha256: hex::encode(hash.finalize()),
+        sha256,
         chunk_size: atom_size,
         batch_size: initial_batch_size,
         adaptive: config.auto_chunk,
@@ -987,6 +1024,11 @@ async fn get_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_hash_path_is_shell_quoted() {
+        assert_eq!(shell_quote("/tmp/a'b $(touch unsafe)"), "'/tmp/a'\\''b $(touch unsafe)'");
+    }
 
     #[test]
     fn groups_only_adjacent_pending_atoms() {
