@@ -9,18 +9,22 @@ mod service;
 mod terminal;
 mod transfer;
 mod transport;
+mod vault;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Parser;
 use config::Config;
 use service::PartialAction;
-use std::{io::{self, Write}, path::PathBuf, process::{Command, Stdio}};
+use std::{io::{self, Read, Write}, path::PathBuf, process::{Command, Stdio}};
+use zeroize::Zeroizing;
 
 #[derive(Parser)]
 #[command(name = "mssh", version, about = "Multi-hop SSH and file copy")]
 struct Cli {
     #[arg(long)]
     config: Option<PathBuf>,
+    #[arg(long)]
+    vault_file: Option<PathBuf>,
     #[arg(long = "route")]
     routes: Vec<String>,
     #[arg(long)]
@@ -61,6 +65,8 @@ struct Cli {
     restart: bool,
     #[arg(long, hide = true)]
     worker_action: Option<String>,
+    #[arg(long, hide = true)]
+    worker_vault_stdin: bool,
     #[arg(required = true, num_args = 1..)]
     args: Vec<String>,
 }
@@ -78,8 +84,19 @@ async fn run() -> Result<()> {
     debug::init(cli.debug);
     debug_log!("command: {:?}", cli.args);
     let path = cli.config.clone().unwrap_or(config::default_path()?);
+    if let [cmd, rest @ ..] = cli.args.as_slice() {
+        if cmd == "vault" {
+            return vault::command(&path, cli.vault_file.as_deref(), rest);
+        }
+    }
     debug_log!("loading configuration from {}", path.display());
     let mut config = Config::load(&path)?;
+    config.vault = vault::VaultStore::at(vault::path(&path, cli.vault_file.as_deref(), false)?);
+    if cli.worker_vault_stdin {
+        let mut bytes = Zeroizing::new(Vec::new());
+        io::stdin().read_to_end(&mut bytes)?;
+        config.vault.load_snapshot(&bytes)?;
+    }
     debug_log!("configuration loaded: {} nodes, {} routes", config.nodes.len(), config.effective_routes().len());
     for name in &cli.routes {
         ensure!(config.effective_routes().iter().any(|r| &r.name == name && !r.disabled), "unknown or disabled route: {name}");
@@ -164,7 +181,8 @@ async fn run() -> Result<()> {
             let action = choose_action(&cli, &plan)?;
             if cli.background {
                 debug_log!("starting background copy worker");
-                spawn_worker(&cli, &path, action)?;
+                unlock_worker_vault(&config, &plan).await?;
+                spawn_worker(&cli, &path, action, &config.vault)?;
                 println!("transfer started in background: {source} -> {destination}");
             } else {
                 debug_log!("running copy in foreground");
@@ -172,7 +190,7 @@ async fn run() -> Result<()> {
                 println!("transfer complete: {source} -> {destination}");
             }
         }
-        _ => bail!("usage: mssh TARGET | mssh SOURCE DESTINATION | mssh status [TARGET] | mssh transfers TARGET | mssh config check | mssh serve"),
+        _ => bail!("usage: mssh TARGET | mssh SOURCE DESTINATION | mssh status [TARGET] | mssh transfers TARGET | mssh config check | mssh vault encrypt INPUT | mssh vault decrypt OUTPUT | mssh serve"),
     }
     Ok(())
 }
@@ -213,9 +231,23 @@ fn parse_size(input: &str) -> Result<usize> {
     Ok(bytes)
 }
 
-fn spawn_worker(cli: &Cli, config_path: &std::path::Path, action: PartialAction) -> Result<()> {
+async fn unlock_worker_vault(config: &Config, plan: &service::CopyPlan) -> Result<()> {
+    let mut names = std::collections::BTreeSet::new();
+    for route in config.routes_for(&plan.target) {
+        for hop in &route.hops {
+            if let Some(name) = &config.nodes[hop].password_vault {
+                names.insert(name.as_str());
+            }
+        }
+    }
+    for name in names { config.vault.get(name).await?; }
+    Ok(())
+}
+
+fn spawn_worker(cli: &Cli, config_path: &std::path::Path, action: PartialAction, vault: &vault::VaultStore) -> Result<()> {
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.arg("--config").arg(config_path);
+    if let Some(path) = &cli.vault_file { cmd.arg("--vault-file").arg(path); }
     for route in &cli.routes { cmd.arg("--route").arg(route); }
     if let Some(n) = cli.max_routes { cmd.arg("--max-routes").arg(n.to_string()); }
     if let Some(n) = &cli.chunk_size { cmd.arg("--chunk-size").arg(n); }
@@ -229,7 +261,9 @@ fn spawn_worker(cli: &Cli, config_path: &std::path::Path, action: PartialAction)
     cmd.arg("--worker-action").arg(match action {
         PartialAction::Continue => "continue", PartialAction::Restart => "restart", PartialAction::New => "new",
     });
-    cmd.args(&cli.args).stdin(Stdio::null()).stdout(Stdio::null())
+    let snapshot = vault.snapshot()?.map(Zeroizing::new);
+    if snapshot.is_some() { cmd.arg("--worker-vault-stdin"); }
+    cmd.args(&cli.args).stdin(if snapshot.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::null())
         .stderr(if cli.debug { Stdio::inherit() } else { Stdio::null() });
     #[cfg(unix)] {
         use std::os::unix::process::CommandExt;
@@ -239,7 +273,10 @@ fn spawn_worker(cli: &Cli, config_path: &std::path::Path, action: PartialAction)
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x00000008 | 0x00000200);
     }
-    let child = cmd.spawn().context("cannot start background transfer")?;
+    let mut child = cmd.spawn().context("cannot start background transfer")?;
+    if let Some(bytes) = snapshot {
+        child.stdin.take().context("background vault pipe is unavailable")?.write_all(&bytes)?;
+    }
     debug_log!("background worker spawned with pid {}", child.id());
     println!("worker pid: {}", child.id());
     Ok(())

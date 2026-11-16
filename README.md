@@ -18,7 +18,7 @@ docker compose -f compose.dev.yaml exec -T dev cargo build --locked
 
 The Cargo registry and build output use persistent Docker volumes. After the first setup, run further checks with `docker compose -f compose.dev.yaml exec` without rebuilding the image.
 
-Copy [the example](examples/config.toml) to `~/.config/mssh/config.toml`. Nodes can use a key, SSH agent, password, or a password environment variable. Set `host_key = "SHA256:..."` to pin a host key; unpinned nodes produce a warning. List only hosts reachable from the client in `direct_hosts`. List directed path fragments in `paths`, with the highest-priority fragments first:
+Copy [the example](examples/config.toml) to `~/.config/mssh/config.toml`. Nodes can use a key, SSH agent, password, password environment variable, or encrypted password vault. Set `host_key = "SHA256:..."` to pin a host key; unpinned nodes produce a warning. List only hosts reachable from the client in `direct_hosts`. List directed path fragments in `paths`, with the highest-priority fragments first:
 
 ```toml
 direct_hosts = ["edge_a", "edge_b"]
@@ -30,6 +30,27 @@ paths = [
 ```
 
 `mssh` joins fragments at shared hosts, so the example yields `local -> edge_a -> relay -> internal` before `local -> edge_b -> internal`. A long fragment such as `["edge_a", "relay", "internal"]` also yields routes to `relay` and `internal`. Every prefix is usable; paths are directed and never imply a reverse connection. Generated route IDs are target-based (`internal-1`, `internal-2`) and are shown by `status`. Existing `[[routes]]` configurations still load, but cannot be mixed with `paths` or `direct_hosts`.
+
+### Password vault
+
+Set `password_vault = "server1"` on any nodes that share a named password. Create a plaintext TOML file with arbitrary names and passwords:
+
+```toml
+[passwords]
+server1 = "first password"
+internal = "another password"
+```
+
+```sh
+mssh vault encrypt passwords.toml
+mssh vault decrypt recovered-passwords.toml
+mssh --vault-file /private/servers.vault vault encrypt passwords.toml
+mssh --vault-file /private/servers.vault internal
+```
+
+`vault encrypt` asks for a new vault password twice and writes an encrypted `vault.json`. `vault decrypt` asks once and writes plaintext to the specified new file. Neither command overwrites a file. The vault uses Argon2id and XChaCha20-Poly1305. By default, `mssh` reads `vault.json` beside the active config, including one selected with `--config`; if it is absent there, it looks beside the default config. `--vault-file FILE` selects an explicit path. Encryption writes beside the active config unless `--vault-file` is set.
+
+When authentication reaches a node's `password_vault`, `mssh` asks for the vault password once and keeps the decrypted entries in memory until the command exits. Detached transfers unlock entries needed by their routes before starting and pass them to the worker through a pipe, so they do not ask again. Delete the plaintext source after verifying that the encrypted vault works; keep a backup of the encrypted file and its master password.
 
 ## Commands
 

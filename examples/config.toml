@@ -27,7 +27,7 @@ agent = true
 [nodes.internal]
 host = "10.0.0.15"
 user = "alice"
-password = "REPLACE_WITH_PASSWORD"
+password_vault = "internal"
 local_ssh_port = 2222 # 127.0.0.1:2222 -> SSH on internal
 
 [forwards.internal_web]
