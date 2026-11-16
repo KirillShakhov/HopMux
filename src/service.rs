@@ -153,13 +153,14 @@ pub async fn ssh(config: &Config, target: &str, options: ShellOptions) -> Result
             match transport::connect(config, &route).await {
                 Ok(connection) => (route, Arc::new(connection)),
                 Err(error) => {
-                    crate::debug_log!("SSH shell: route {} failed: {error:#}", output::route_label(&route));
+                    crate::debug::progress(format_args!("SSH shell: route {} failed: {error:#}", output::route_label(&route)));
                     if transport::is_permanent(&error) {
                         routes.retain(|candidate| candidate.name != route.name);
                         if routes.is_empty() {
                             bail!("all routes to {target} have permanent authentication or host-key errors");
                         }
                     }
+                    crate::debug::progress(format_args!("SSH shell: trying another route in 2 seconds"));
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     continue;
                 }
@@ -169,14 +170,16 @@ pub async fn ssh(config: &Config, target: &str, options: ShellOptions) -> Result
                     Some(mode) => mode,
                     None => {
                         let tmux = if matches!(options.preference, ShellPreference::Auto | ShellPreference::Tmux) {
+                            crate::debug::progress(format_args!("SSH shell: checking for tmux on {target}"));
                             remote_command_ok(&connection, "command -v tmux >/dev/null 2>&1").await.unwrap_or(false)
                         } else { false };
                         let screen = if matches!(options.preference, ShellPreference::Screen)
                             || matches!(options.preference, ShellPreference::Auto) && !tmux {
+                            crate::debug::progress(format_args!("SSH shell: checking for screen on {target}"));
                             remote_command_ok(&connection, "command -v screen >/dev/null 2>&1").await.unwrap_or(false)
                         } else { false };
                         let selected = choose_shell_mode(options.preference, tmux, screen);
-                        crate::debug_log!("SSH shell: server-side mode {selected:?}");
+                        crate::debug::progress(format_args!("SSH shell: using {selected:?} mode on {target}"));
                         mode = Some(selected);
                         selected
                     }
@@ -185,7 +188,7 @@ pub async fn ssh(config: &Config, target: &str, options: ShellOptions) -> Result
                     raw_terminal = Some(RawTerminal::new()?);
                     stdin = Some(terminal::Input::new()?);
                 }
-                crate::debug_log!("SSH shell: attached via {}", output::route_label(&route));
+                crate::debug::progress(format_args!("SSH shell: opening terminal via {}", output::route_label(&route)));
                 match shell(connection, selected_mode, &session_name, stdin.as_mut().unwrap(),
                     config.clone(), routes.clone(), route.clone(), options).await {
                     Ok(ShellEnd::InputEnded | ShellEnd::RemoteClosed { exited: true }) => {

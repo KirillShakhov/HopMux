@@ -289,6 +289,12 @@ fn retry_route(error: &anyhow::Error, attempts: u32) -> bool {
     !transport::is_permanent(error) && attempts < MAX_ROUTE_ATTEMPTS
 }
 
+fn chunk_range(indices: &[usize]) -> String {
+    let first = indices.first().expect("batch is nonempty") + 1;
+    let last = indices.last().expect("batch is nonempty") + 1;
+    if first == last { first.to_string() } else { format!("{first}..{last}") }
+}
+
 async fn note_batch(
     shared: &Arc<Mutex<Journal>>,
     save_lock: &Arc<Mutex<()>>,
@@ -316,7 +322,7 @@ async fn note_batch(
             .map_or(sample_bps, |old| old * 0.7 + sample_bps * 0.3),
     );
     stats.last_at_unix_ms = now_unix_ms();
-    crate::debug_log!("transfer {}: atoms {}..={} offset={} bytes={} route={} elapsed={} ms committed", journal.id, indices[0], indices[indices.len() - 1], indices[0] as u64 * journal.chunk_size as u64, bytes, route_display, elapsed.as_millis());
+    crate::debug_log!("transfer {}: chunks {} offset={} bytes={} route={} elapsed={} ms committed", journal.id, chunk_range(indices), indices[0] as u64 * journal.chunk_size as u64, bytes, route_display, elapsed.as_millis());
     journal.uncheckpointed_bytes = journal.uncheckpointed_bytes.saturating_add(bytes as u64);
     let checkpoint = journal.uncheckpointed_bytes >= CHECKPOINT_BYTES || journal.checkpoint_at.elapsed() >= CHECKPOINT_INTERVAL;
     if journal.adaptive && bytes >= selected_size {
@@ -330,11 +336,13 @@ async fn note_batch(
         }
     }
     crate::debug::write_stderr(format_args!(
-        "{}: {}/{} chunks via {}",
+        "{}: chunks {} of {} via {}; {}/{} complete",
         journal.id,
+        chunk_range(indices),
+        journal.complete.len(),
+        route_display,
         journal.complete.iter().filter(|&&done| done).count(),
         journal.complete.len(),
-        route_display
     ));
     drop(journal);
     if checkpoint { save_shared(shared, save_lock, sftp, None, false).await?; }
@@ -504,13 +512,15 @@ pub async fn discard(config: &Config, journal: &Journal) -> Result<()> {
 }
 
 pub(crate) async fn sftp(connection: &transport::Connection) -> Result<SftpSession> {
-    crate::debug_log!("SFTP: opening subsystem channel");
+    crate::debug::progress(format_args!("SFTP: opening subsystem channel"));
     let channel = connection.final_handle().channel_open_session().await?;
     channel.request_subsystem(true, "sftp").await?;
-    Ok(SftpSession::new_with_config(channel.into_stream(), russh_sftp::client::Config {
+    let session = SftpSession::new_with_config(channel.into_stream(), russh_sftp::client::Config {
         request_timeout_secs: 300,
         ..Default::default()
-    }).await?)
+    }).await?;
+    crate::debug::progress(format_args!("SFTP: subsystem ready"));
+    Ok(session)
 }
 
 pub(crate) async fn connect_any(config: &Config, target: &str) -> Result<transport::Connection> {
@@ -519,7 +529,7 @@ pub(crate) async fn connect_any(config: &Config, target: &str) -> Result<transpo
         crate::debug_log!("SFTP: trying route {}", output::route_label(&route));
         match transport::connect(config, &route).await {
             Ok(connection) => { crate::debug_log!("SFTP: route {} connected", output::route_label(&route)); return Ok(connection) },
-            Err(error) => { crate::debug_log!("SFTP: route {} failed: {error:#}", output::route_label(&route)); last_error = Some(error) },
+            Err(error) => { crate::debug::progress(format_args!("SFTP: route {} failed: {error:#}", output::route_label(&route))); last_error = Some(error) },
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("no route to target {target}")))
@@ -699,6 +709,8 @@ async fn process_put(
     control_sftp: &SftpSession,
 ) -> Result<()> {
     crate::debug_log!("upload {}: processing {} pending chunks", journal.id, journal.complete.iter().filter(|&&done| !done).count());
+    crate::debug::write_stderr(format_args!("{}: {}/{} chunks complete; starting upload",
+        journal.id, journal.complete.iter().filter(|&&done| done).count(), journal.complete.len()));
     let source = Path::new(&journal.source);
     let (size, sha256, mtime) = local_source(source, journal.verify).await?;
     ensure!(
@@ -953,6 +965,8 @@ pub async fn get(config: &Config, target: &str, source: &str, destination: &Path
 
 async fn process_get(config: &Config, journal: &mut Journal, control_sftp: &SftpSession) -> Result<()> {
     crate::debug_log!("download {}: processing {} pending chunks", journal.id, journal.complete.iter().filter(|&&done| !done).count());
+    crate::debug::write_stderr(format_args!("{}: {}/{} chunks complete; starting download",
+        journal.id, journal.complete.iter().filter(|&&done| done).count(), journal.complete.len()));
     let mut routes: Vec<Route> = config
         .routes_for(&journal.target)
         .into_iter()
@@ -1135,6 +1149,12 @@ mod tests {
         assert_eq!(claim_group(&mut pending, 2), [4, 5]);
         assert_eq!(claim_group(&mut pending, 2), [6]);
         assert!(claim_group(&mut pending, 2).is_empty());
+    }
+
+    #[test]
+    fn progress_names_every_chunk_in_the_first_batch() {
+        assert_eq!(chunk_range(&[0, 1, 2, 3]), "1..4");
+        assert_eq!(chunk_range(&[4]), "5");
     }
 
     #[test]

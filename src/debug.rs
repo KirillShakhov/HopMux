@@ -20,6 +20,14 @@ pub fn log(message: fmt::Arguments<'_>) {
     }
 }
 
+pub fn progress(message: fmt::Arguments<'_>) {
+    if ENABLED.load(Ordering::Relaxed) {
+        log(message);
+    } else {
+        write_stderr(message);
+    }
+}
+
 pub fn write_stderr(message: fmt::Arguments<'_>) {
     let _ = writeln!(io::stderr().lock(), "{message}");
 }
