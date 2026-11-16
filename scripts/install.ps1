@@ -4,7 +4,7 @@ if (-not [Environment]::Is64BitOperatingSystem) {
     throw 'mssh: this installer supports Windows x86_64'
 }
 
-$repo = 'KirillShakhov/HopMux'
+$repo = 'KirillShakhov/MultiHopSSH'
 $installDir = if ($env:MSSH_INSTALL_DIR) { $env:MSSH_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'Programs\mssh' }
 $configDir = if ($env:MSSH_CONFIG_DIR) { $env:MSSH_CONFIG_DIR } else { Join-Path $env:APPDATA 'mssh' }
 $releaseUrl = if ($env:MSSH_RELEASE_URL) { $env:MSSH_RELEASE_URL } else { "https://github.com/$repo/releases/latest/download/mssh-windows-x86_64.exe" }

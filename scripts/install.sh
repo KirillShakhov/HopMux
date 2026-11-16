@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-repo=KirillShakhov/HopMux
+repo=KirillShakhov/MultiHopSSH
 case "$(uname -s):$(uname -m)" in
     Linux:x86_64|Linux:amd64) asset=mssh-linux-x86_64 ;;
     *) echo "mssh: this installer supports Linux x86_64" >&2; exit 1 ;;

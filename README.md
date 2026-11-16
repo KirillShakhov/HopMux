@@ -7,13 +7,13 @@
 Linux x86_64:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/KirillShakhov/HopMux/main/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/KirillShakhov/MultiHopSSH/main/scripts/install.sh | sh
 ```
 
 Windows x86_64 (PowerShell):
 
 ```powershell
-irm https://raw.githubusercontent.com/KirillShakhov/HopMux/main/scripts/install.ps1 | iex
+irm https://raw.githubusercontent.com/KirillShakhov/MultiHopSSH/main/scripts/install.ps1 | iex
 ```
 
 Run the same command again to update. The installers come from `main` and download the latest release binary. Linux installs `mssh` to `~/.local/bin` and adds that directory to the shell PATH for new terminals when needed. Windows installs to `%LOCALAPPDATA%\Programs\mssh` and adds it to the user PATH. If no config exists, the installer copies `examples/config.toml` from `main` to `~/.config/mssh/config.toml` on Linux or `%APPDATA%\mssh\config.toml` on Windows. Existing configs are preserved. Edit the example's hosts and credentials before connecting.
