@@ -5,7 +5,7 @@ test_home=$(mktemp -d)
 trap 'rm -rf "$test_home"' EXIT
 export HOME="$test_home"
 unset XDG_CONFIG_HOME
-export MSSH_RELEASE_URL="file://$(pwd)/target/release/mssh"
+export MSSH_RELEASE_URL="file://$(pwd)/${MSSH_TEST_BINARY:-target/release/mssh}"
 export MSSH_EXAMPLE_URL="file://$(pwd)/examples/config.toml"
 
 sh scripts/install.sh
