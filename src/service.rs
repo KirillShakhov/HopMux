@@ -491,13 +491,30 @@ pub enum PartialAction {
     New,
 }
 
-fn remote_spec<'a>(config: &Config, arg: &'a str) -> Result<Option<(&'a str, &'a str)>> {
+fn remote_spec<'c, 'a>(config: &'c Config, arg: &'a str) -> Result<Option<(&'c str, &'a str)>> {
     let Some((target, path)) = arg.split_once(':') else { return Ok(None) };
-    if !config.nodes.contains_key(target) {
-        return Ok(None);
-    }
+    let Some(canonical) = config.resolve_node_name(target) else { return Ok(None) };
     ensure!(path.starts_with('/'), "remote path must be absolute: {arg}");
-    Ok(Some((target, path)))
+    Ok(Some((canonical, path)))
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+
+    #[test]
+    fn scp_style_paths_use_canonical_node_name() {
+        let config: Config = toml::from_str(r#"
+            [nodes.internal]
+            host = "10.0.0.5"
+            user = "alice"
+            key_file = "key"
+            aliases = ["db"]
+        "#).unwrap();
+        assert_eq!(remote_spec(&config, "db:/tmp/test").unwrap(), Some(("internal", "/tmp/test")));
+        assert_eq!(remote_spec(&config, "internal:/tmp/test").unwrap(), Some(("internal", "/tmp/test")));
+        assert!(remote_spec(&config, "db:relative").is_err());
+    }
 }
 
 pub async fn prepare_copy(config: &Config, source: &str, destination: &str, recursive: bool) -> Result<CopyPlan> {

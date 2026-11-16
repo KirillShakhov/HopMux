@@ -156,7 +156,8 @@ async fn run() -> Result<()> {
         },
         [cmd] if cmd == "status" => show_status(&config, None, cli.json, cli.details).await?,
         [cmd, target] if cmd == "status" => show_status(&config, Some(target), cli.json, cli.details).await?,
-        [target] if config.nodes.contains_key(target) => {
+        [target] if config.resolve_node_name(target).is_some() => {
+            let target = config.resolve_node_name(target).unwrap();
             debug_log!("opening SSH shell to {target}");
             let preference = match cli.shell_mode.as_str() {
                 "tmux" => service::ShellPreference::Tmux,
@@ -283,7 +284,7 @@ fn spawn_worker(cli: &Cli, config_path: &std::path::Path, action: PartialAction,
 }
 
 async fn show_transfers(config: &Config, target: &str, json: bool) -> Result<()> {
-    ensure!(config.nodes.contains_key(target), "unknown target: {target}");
+    let target = config.resolve_node_name(target).ok_or_else(|| anyhow::anyhow!("unknown target: {target}"))?;
     let journals = transfer::list(config, target).await?;
     debug_log!("found {} transfer journals on {target}", journals.len());
     if json { println!("{}", serde_json::to_string_pretty(&journals)?); }
@@ -299,7 +300,8 @@ async fn show_transfers(config: &Config, target: &str, json: bool) -> Result<()>
 }
 
 async fn show_status(config: &Config, target: Option<&str>, json: bool, details: bool) -> Result<()> {
-    if let Some(target) = target { ensure!(config.nodes.contains_key(target), "unknown target: {target}"); }
+    let target = target.map(|name| config.resolve_node_name(name)
+        .ok_or_else(|| anyhow::anyhow!("unknown target: {name}"))).transpose()?;
     let routes = service::probe_routes(config, target).await;
     debug_log!("probed {} routes", routes.len());
     let all_down = routes.iter().all(|r| r.state != "UP");
