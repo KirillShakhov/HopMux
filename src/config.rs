@@ -84,6 +84,8 @@ impl Default for Settings {
 #[serde(deny_unknown_fields)]
 pub struct Node {
     pub host: String,
+    #[serde(default)]
+    pub aliases: Vec<String>,
     #[serde(default = "default_port")]
     pub port: u16,
     pub local_ssh_port: Option<u16>,
@@ -126,6 +128,7 @@ impl std::fmt::Debug for Node {
         formatter
             .debug_struct("Node")
             .field("host", &self.host)
+            .field("aliases", &self.aliases)
             .field("port", &self.port)
             .field("user", &self.user)
             .field("host_key", &self.host_key)
@@ -175,6 +178,7 @@ impl Config {
         crate::debug_log!("config: reading {}", path.display());
         let mut seen = BTreeSet::new();
         let mut config = Self::read_recursive(path, &mut seen)?;
+        config.normalize_node_references()?;
         crate::debug_log!("config: validating {} nodes, {} paths, {} direct hosts and {} legacy routes", config.nodes.len(), config.paths.len(), config.direct_hosts.len(), config.routes.len());
         config.validate()?;
         config.routes.sort_by_key(|r| (r.priority, r.name.clone()));
@@ -230,6 +234,7 @@ impl Config {
 
     pub fn validate(&self) -> Result<()> {
         ensure!(!self.nodes.is_empty(), "no nodes configured");
+        self.alias_map()?;
         ensure!(
             self.settings.connect_timeout_secs > 0 && self.settings.check_interval_secs > 0,
             "timeouts and check intervals must be positive"
@@ -434,11 +439,61 @@ impl Config {
     }
 
     pub fn routes_for(&self, target: &str) -> Vec<Route> {
+        let Some(target) = self.resolve_node_name(target) else { return Vec::new() };
         self.effective_routes()
             .into_iter()
             .filter(|r| !r.disabled && r.target == target &&
                 (self.route_filter.is_empty() || self.route_filter.contains(&r.name)))
             .collect()
+    }
+
+    pub fn resolve_node_name<'a>(&'a self, name: &str) -> Option<&'a str> {
+        if let Some((canonical, _)) = self.nodes.get_key_value(name) {
+            return Some(canonical);
+        }
+        self.nodes.iter().find_map(|(canonical, node)|
+            node.aliases.iter().any(|alias| alias == name).then_some(canonical.as_str()))
+    }
+
+    fn alias_map(&self) -> Result<BTreeMap<String, String>> {
+        let mut aliases = BTreeMap::new();
+        for (canonical, node) in &self.nodes {
+            for alias in &node.aliases {
+                ensure!(!alias.is_empty() && !alias.chars().any(char::is_whitespace)
+                    && !alias.contains([':', '/', '\\'])
+                    && !["serve", "status", "transfers", "config", "vault"].contains(&alias.as_str()),
+                    "node {canonical}: invalid alias {alias:?}");
+                ensure!(!self.nodes.contains_key(alias),
+                    "node {canonical}: alias {alias:?} conflicts with a node name");
+                ensure!(aliases.insert(alias.clone(), canonical.clone()).is_none(),
+                    "duplicate node alias {alias:?}");
+            }
+        }
+        Ok(aliases)
+    }
+
+    fn normalize_node_references(&mut self) -> Result<()> {
+        let aliases = self.alias_map()?;
+        let canonical = |name: &mut String| {
+            if let Some(id) = aliases.get(name) { *name = id.clone(); }
+        };
+        for name in &mut self.direct_hosts { canonical(name); }
+        for path in &mut self.paths {
+            for name in path { canonical(name); }
+        }
+        for route in &mut self.routes {
+            canonical(&mut route.target);
+            for hop in &mut route.hops { canonical(hop); }
+            let mut addresses = BTreeMap::new();
+            for (mut node, address) in std::mem::take(&mut route.addresses) {
+                canonical(&mut node);
+                ensure!(addresses.insert(node.clone(), address).is_none(),
+                    "route {}: duplicate address override for {node}", route.name);
+            }
+            route.addresses = addresses;
+        }
+        for forward in self.forwards.values_mut() { canonical(&mut forward.via); }
+        Ok(())
     }
 }
 
@@ -514,6 +569,69 @@ mod tests {
             user = "alice"
             key_file = "key"
         "#).unwrap()
+    }
+
+    #[test]
+    fn aliases_resolve_and_normalize_graph_references() {
+        let mut config = graph_sample();
+        config.nodes.get_mut("target").unwrap().aliases = vec!["db".into(), "prod-db".into()];
+        config.nodes.get_mut("edge_a").unwrap().aliases = vec!["gateway".into()];
+        config.direct_hosts[0] = "gateway".into();
+        config.paths[0][0] = "gateway".into();
+        config.paths[3][1] = "db".into();
+        config.normalize_node_references().unwrap();
+        config.validate().unwrap();
+        assert_eq!(config.resolve_node_name("db"), Some("target"));
+        assert_eq!(config.resolve_node_name("prod-db"), Some("target"));
+        assert_eq!(config.routes_for("db")[0].target, "target");
+        assert_eq!(config.direct_hosts[0], "edge_a");
+        assert_eq!(config.paths[3][1], "target");
+    }
+
+    #[test]
+    fn rejects_duplicate_conflicting_and_reserved_aliases() {
+        let mut config = graph_sample();
+        config.nodes.get_mut("target").unwrap().aliases = vec!["db".into()];
+        config.nodes.get_mut("hub").unwrap().aliases = vec!["db".into()];
+        assert!(config.validate().unwrap_err().to_string().contains("duplicate node alias"));
+        config.nodes.get_mut("hub").unwrap().aliases.clear();
+        config.nodes.get_mut("target").unwrap().aliases = vec!["hub".into()];
+        assert!(config.validate().unwrap_err().to_string().contains("conflicts with a node name"));
+        config.nodes.get_mut("target").unwrap().aliases = vec!["status".into()];
+        assert!(config.validate().unwrap_err().to_string().contains("invalid alias"));
+    }
+
+    #[test]
+    fn load_resolves_aliases_in_legacy_routes_and_forwards() {
+        let path = std::env::temp_dir().join(format!("mssh-alias-{}.toml", uuid::Uuid::new_v4()));
+        fs::write(&path, r#"
+            [nodes.gateway]
+            host = "gateway.example"
+            user = "alice"
+            key_file = "key"
+            aliases = ["gw"]
+            [nodes.internal]
+            host = "10.0.0.5"
+            user = "alice"
+            key_file = "key"
+            aliases = ["db"]
+            [[routes]]
+            name = "via-gateway"
+            target = "db"
+            hops = ["gw", "db"]
+            [routes.addresses]
+            db = "10.0.0.5"
+            [forwards.sql]
+            via = "db"
+            listen = "127.0.0.1:15432"
+            remote = "127.0.0.1:5432"
+        "#).unwrap();
+        let config = Config::load(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(config.routes[0].target, "internal");
+        assert_eq!(config.routes[0].hops, ["gateway", "internal"]);
+        assert!(config.routes[0].addresses.contains_key("internal"));
+        assert_eq!(config.forwards["sql"].via, "internal");
     }
 
     #[test]

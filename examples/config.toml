@@ -26,6 +26,7 @@ agent = true
 
 [nodes.internal]
 host = "10.0.0.15"
+aliases = ["db", "prod-db"]
 user = "alice"
 password_vault = "internal"
 local_ssh_port = 2222 # 127.0.0.1:2222 -> SSH on internal

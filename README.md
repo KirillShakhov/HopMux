@@ -52,6 +52,10 @@ mssh --vault-file /private/servers.vault internal
 
 When authentication reaches a node's `password_vault`, `mssh` asks for the vault password once and keeps the decrypted entries in memory until the command exits. Detached transfers unlock entries needed by their routes before starting and pass them to the worker through a pipe, so they do not ask again. Delete the plaintext source after verifying that the encrypted vault works; keep a backup of the encrypted file and its master password.
 
+### Node aliases
+
+A node can declare `aliases = ["db", "prod-db"]` under `[nodes.internal]`. Use an alias in commands (`mssh db`, `mssh status db`, `mssh transfers db`), file paths (`mssh db:/tmp/test ./`), and node references in `direct_hosts`, `paths`, `routes`, and `forwards.*.via`. Route IDs, status output, and transfer journals continue to use the canonical node name. Aliases must be unique, cannot match another node name, and cannot use reserved command names.
+
 ## Commands
 
 ```sh
