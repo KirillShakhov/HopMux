@@ -18,7 +18,7 @@ docker compose -f compose.dev.yaml exec -T dev cargo build --locked
 
 The Cargo registry and build output use persistent Docker volumes. After the first setup, run further checks with `docker compose -f compose.dev.yaml exec` without rebuilding the image.
 
-Copy [the example](examples/config.toml) to `~/.config/mssh/config.toml`. Nodes can use a key, SSH agent, password, password environment variable, or encrypted password vault. Set `host_key = "SHA256:..."` to pin a host key; unpinned nodes produce a warning. List only hosts reachable from the client in `direct_hosts`. List directed path fragments in `paths`, with the highest-priority fragments first:
+Copy [the example](examples/config.toml) to `~/.config/mssh/config.toml`. The default config location is the whole `~/.config/mssh` directory, so you can put several `.toml` configs there. `--config PATH` accepts either one file or a directory. For a directory, `mssh` chooses the config containing the first host named in the command (for example `mssh edge_a` or `mssh ./file edge_a:/tmp/file`). If several configs contain that host, it asks which file to use. Commands without a host, such as `mssh status`, also ask when the directory contains several configs; use `--config FILE` for noninteractive runs. A background transfer passes the selected file to its worker. Nodes can use a key, SSH agent, password, password environment variable, or encrypted password vault. Set `host_key = "SHA256:..."` to pin a host key; unpinned nodes produce a warning. List only hosts reachable from the client in `direct_hosts`. List directed path fragments in `paths`, with the highest-priority fragments first:
 
 ```toml
 direct_hosts = ["edge_a", "edge_b"]

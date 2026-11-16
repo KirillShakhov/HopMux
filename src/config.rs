@@ -500,7 +500,7 @@ impl Config {
 pub fn default_path() -> Result<PathBuf> {
     Ok(dirs::config_dir()
         .context("cannot find config directory")?
-        .join("mssh/config.toml"))
+        .join("mssh"))
 }
 
 #[cfg(test)]

@@ -1,4 +1,5 @@
 mod config;
+mod config_selection;
 mod debug;
 mod directory;
 mod forward;
@@ -83,7 +84,8 @@ async fn run() -> Result<()> {
     let cli = Cli::parse();
     debug::init(cli.debug);
     debug_log!("command: {:?}", cli.args);
-    let path = cli.config.clone().unwrap_or(config::default_path()?);
+    let location = cli.config.clone().unwrap_or(config::default_path()?);
+    let path = config_selection::select_path(&location, &cli.args)?;
     if let [cmd, rest @ ..] = cli.args.as_slice() {
         if cmd == "vault" {
             return vault::command(&path, cli.vault_file.as_deref(), rest);

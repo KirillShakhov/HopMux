@@ -126,10 +126,7 @@ pub fn path(config_path: &Path, explicit: Option<&Path>, for_write: bool) -> Res
     if for_write || nearby.exists() {
         return Ok(nearby);
     }
-    Ok(crate::config::default_path()?
-        .parent()
-        .context("default config path has no parent")?
-        .join(VAULT_NAME))
+    Ok(crate::config::default_path()?.join(VAULT_NAME))
 }
 
 fn validate(passwords: &Passwords) -> Result<()> {
@@ -307,11 +304,7 @@ mod tests {
         assert_eq!(path(&config, None, true).unwrap(), nearby);
         assert_eq!(
             path(&config, None, false).unwrap(),
-            crate::config::default_path()
-                .unwrap()
-                .parent()
-                .unwrap()
-                .join(VAULT_NAME)
+            crate::config::default_path().unwrap().join(VAULT_NAME)
         );
         fs::write(&nearby, b"test").unwrap();
         assert_eq!(path(&config, None, false).unwrap(), nearby);
