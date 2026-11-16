@@ -23,16 +23,15 @@ jobs:
         run: cargo test --locked
       - name: Build release binary
         run: cargo build --release --locked
-      - name: Package Windows binary
+      - name: Test installer
         shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path mssh-windows-x86_64/examples -Force | Out-Null
-          Copy-Item target/release/mssh.exe, LICENSE, README.md mssh-windows-x86_64/
-          Copy-Item examples/config.toml mssh-windows-x86_64/examples/
-          Compress-Archive -Path mssh-windows-x86_64 -DestinationPath mssh-windows-x86_64.zip
+        run: ./tests/install-windows.ps1 -BinaryPath target/release/mssh.exe
+      - name: Prepare Windows binary
+        shell: pwsh
+        run: Copy-Item target/release/mssh.exe mssh-windows-x86_64.exe
       - name: Add Windows build to release
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload $env:RELEASE_TAG mssh-windows-x86_64.zip --repo $env:GITHUB_REPOSITORY --clobber
+        run: gh release upload $env:RELEASE_TAG mssh-windows-x86_64.exe --repo $env:GITHUB_REPOSITORY --clobber
