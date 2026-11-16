@@ -23,14 +23,12 @@ jobs:
         run: cargo test --locked
       - name: Build release binary
         run: cargo build --release --locked
-      - name: Package Linux binary
-        run: |
-          mkdir -p mssh-linux-x86_64/examples
-          cp target/release/mssh LICENSE README.md mssh-linux-x86_64/
-          cp examples/config.toml mssh-linux-x86_64/examples/
-          tar -czf mssh-linux-x86_64.tar.gz mssh-linux-x86_64
+      - name: Test installer
+        run: sh tests/install-linux.sh
+      - name: Prepare Linux binary
+        run: cp target/release/mssh mssh-linux-x86_64
       - name: Add Linux build to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RELEASE_TAG: ${{ github.event.release.tag_name }}
-        run: gh release upload "$RELEASE_TAG" mssh-linux-x86_64.tar.gz --repo "$GITHUB_REPOSITORY" --clobber
+        run: gh release upload "$RELEASE_TAG" mssh-linux-x86_64 --repo "$GITHUB_REPOSITORY" --clobber
