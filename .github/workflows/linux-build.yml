@@ -22,11 +22,13 @@ jobs:
       - name: Run tests
         run: cargo test --locked
       - name: Build release binary
-        run: cargo build --release --locked
+        run: cargo build --profile release-small --locked
       - name: Test installer
         run: sh tests/install-linux.sh
+        env:
+          MSSH_TEST_BINARY: target/release-small/mssh
       - name: Prepare Linux binary
-        run: cp target/release/mssh mssh-linux-x86_64
+        run: cp target/release-small/mssh mssh-linux-x86_64
       - name: Add Linux build to release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
