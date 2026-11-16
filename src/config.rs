@@ -37,6 +37,8 @@ pub struct Config {
     pub route_chunk_sizes: BTreeMap<String, usize>,
     #[serde(skip)]
     pub verify: bool,
+    #[serde(skip)]
+    pub vault: crate::vault::VaultStore,
 }
 
 fn default_auto_chunk() -> bool { true }
@@ -90,6 +92,7 @@ pub struct Node {
     pub key_file: Option<String>,
     pub key_passphrase_env: Option<String>,
     pub password_env: Option<String>,
+    pub password_vault: Option<String>,
     #[serde(skip_serializing)]
     pub password: Option<String>,
     #[serde(default)]
@@ -129,6 +132,7 @@ impl std::fmt::Debug for Node {
             .field("key_file", &self.key_file)
             .field("key_passphrase_env", &self.key_passphrase_env)
             .field("password_env", &self.password_env)
+            .field("password_vault", &self.password_vault)
             .field("password_configured", &self.password.is_some())
             .field("agent", &self.agent)
             .finish()
@@ -258,13 +262,18 @@ impl Config {
                 node.key_file.is_some()
                     || node.password_env.is_some()
                     || node.password.is_some()
+                    || node.password_vault.is_some()
                     || node.agent,
-                "node {id}: configure key_file, password, password_env or agent"
+                "node {id}: configure key_file, password, password_env, password_vault or agent"
             );
             ensure!(
-                node.password.is_none() || node.password_env.is_none(),
-                "node {id}: choose password or password_env, not both"
+                usize::from(node.password.is_some()) + usize::from(node.password_env.is_some())
+                    + usize::from(node.password_vault.is_some()) <= 1,
+                "node {id}: choose only one of password, password_env or password_vault"
             );
+            if let Some(name) = &node.password_vault {
+                ensure!(!name.is_empty(), "node {id}: password_vault must not be empty");
+            }
             if let Some(password) = &node.password {
                 ensure!(
                     !password.is_empty(),
@@ -697,8 +706,15 @@ mod tests {
                 .validate()
                 .unwrap_err()
                 .to_string()
-                .contains("choose password or password_env")
+                .contains("choose only one of password, password_env or password_vault")
         );
+        let mut config = sample();
+        let node = config.nodes.get_mut("internal").unwrap();
+        node.password_env = None;
+        node.password_vault = Some("server1".into());
+        config.validate().unwrap();
+        config.nodes.get_mut("internal").unwrap().password = Some("secret".into());
+        assert!(config.validate().is_err());
     }
 
     #[test]

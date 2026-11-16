@@ -88,11 +88,11 @@ pub fn failure_state(error: &anyhow::Error) -> &'static str {
     }
 }
 
-async fn authenticate(handle: &mut client::Handle<HostKeyPin>, node: &Node, route_path: &str) -> Result<()> {
+async fn authenticate(handle: &mut client::Handle<HostKeyPin>, node: &Node, route_path: &str, vault: &crate::vault::VaultStore, duration: Duration) -> Result<()> {
     let mut method_errors = Vec::new();
     if let Some(path) = &node.key_file {
         crate::debug_log!("auth {} at {}: trying key", route_path, node.host);
-        let attempt: Result<bool> = async {
+        let attempt: Result<bool> = timeout(duration, async {
             let expanded = if let Some(rest) = path.strip_prefix("~/") {
                 dirs::home_dir()
                     .context("cannot find home directory")?
@@ -113,8 +113,9 @@ async fn authenticate(handle: &mut client::Handle<HostKeyPin>, node: &Node, rout
                 .authenticate_publickey(&node.user, PrivateKeyWithHashAlg::new(Arc::new(key), hash))
                 .await?
                 .success())
-        }
-        .await;
+        })
+        .await
+        .context("key authentication timed out")?;
         match attempt {
             Ok(true) => { crate::debug_log!("auth {} at {}: key accepted", route_path, node.host); return Ok(()) },
             Ok(false) => { crate::debug_log!("auth {} at {}: key rejected", route_path, node.host); method_errors.push("key rejected".to_owned()) },
@@ -123,7 +124,8 @@ async fn authenticate(handle: &mut client::Handle<HostKeyPin>, node: &Node, rout
     }
     if node.agent {
         crate::debug_log!("auth {} at {}: trying SSH agent", route_path, node.host);
-        match authenticate_agent(handle, node).await {
+        match timeout(duration, authenticate_agent(handle, node)).await
+            .context("SSH agent authentication timed out")? {
             Ok(true) => { crate::debug_log!("auth {} at {}: SSH agent accepted", route_path, node.host); return Ok(()) },
             Ok(false) => { crate::debug_log!("auth {} at {}: SSH agent identities rejected", route_path, node.host); method_errors.push("agent identities rejected".to_owned()) },
             Err(error) => { crate::debug_log!("auth {} at {}: SSH agent unavailable: {error:#}", route_path, node.host); method_errors.push(format!("agent unavailable: {error:#}")) },
@@ -139,14 +141,16 @@ async fn authenticate(handle: &mut client::Handle<HostKeyPin>, node: &Node, rout
                 None
             }
         }
+    } else if let Some(name) = &node.password_vault {
+        Some(vault.get(name).await?)
     } else {
         None
     };
     if let Some(password) = password {
         crate::debug_log!("auth {} at {}: trying password", route_path, node.host);
-        if handle
-            .authenticate_password(&node.user, password)
-            .await?
+        if timeout(duration, handle.authenticate_password(&node.user, password))
+            .await
+            .context("password authentication timed out")??
             .success()
         {
             crate::debug_log!("auth {} at {}: password accepted", route_path, node.host);
@@ -256,11 +260,8 @@ pub async fn connect(config: &Config, route: &Route) -> Result<Connection> {
             })?
         };
         crate::debug_log!("route {route_path}: hop {hop} SSH handshake complete");
-        timeout(duration, authenticate(&mut handle, node, &route_path))
+        authenticate(&mut handle, node, &route_path, &config.vault, duration)
             .await
-            .with_context(|| {
-                format!("authentication timed out at node {hop} on route {route_path}")
-            })?
             .with_context(|| format!("at node {hop} on route {route_path}"))?;
         handles.push(handle);
         crate::debug_log!("route {route_path}: hop {hop} authenticated in {} ms", hop_started.elapsed().as_millis());

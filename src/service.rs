@@ -21,7 +21,7 @@ pub fn auth_statuses(config: &Config) -> Vec<AuthStatus> {
             } else { Some(PathBuf::from(path)) };
             expanded.is_some_and(|path| path.is_file())
         });
-        let password_available = node.password.is_some() || node.password_env.as_ref()
+        let password_available = node.password.is_some() || node.password_vault.is_some() || node.password_env.as_ref()
             .is_some_and(|name| std::env::var_os(name).is_some());
         let agent_available = node.agent && cfg!(unix) && std::env::var_os("SSH_AUTH_SOCK")
             .is_some_and(|path| Path::new(&path).exists());
