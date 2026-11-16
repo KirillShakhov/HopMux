@@ -3,6 +3,7 @@ mod debug;
 mod directory;
 mod forward;
 mod output;
+mod remote_copy;
 mod routing;
 mod service;
 mod terminal;
@@ -354,5 +355,10 @@ mod tests {
         assert_eq!(tuned.route_chunks, ["via-a=512KiB"]);
         assert_eq!(parse_size("320KiB").unwrap(), 320 * 1024);
         assert!(parse_size("300KB").is_err());
+        let between_hosts = Cli::try_parse_from([
+            "mssh", "--verify", "internal_a:/tmp/test", "internal_b:/tmp/test",
+        ]).unwrap();
+        assert_eq!(between_hosts.args, ["internal_a:/tmp/test", "internal_b:/tmp/test"]);
+        assert!(between_hosts.verify);
     }
 }

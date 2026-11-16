@@ -556,7 +556,7 @@ async fn remote_hash_command(connection: &transport::Connection, path: &str) -> 
     tokio::time::timeout(Duration::from_secs(3600), work).await.context("remote SHA-256 command timed out")?
 }
 
-async fn remote_hash_sftp(sftp: &SftpSession, path: &str, buffer_size: usize) -> Result<String> {
+pub(crate) async fn remote_hash_sftp(sftp: &SftpSession, path: &str, buffer_size: usize) -> Result<String> {
     let mut remote = sftp.open(path).await?;
     let mut hash = Sha256::new();
     let mut buffer = vec![0u8; buffer_size.min(1024 * 1024)];

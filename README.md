@@ -37,6 +37,7 @@ paths = [
 mssh edge_a
 mssh edge_a:/home/niias/test.yml ./downloads/
 mssh ./download/test.yml edge_a:/home/niias
+mssh internal_a:/tmp/test internal_b:/tmp/test
 mssh -r ./project edge_a:/home/niias
 mssh -d edge_a:/home/niias/test.yml ./downloads/
 mssh transfers edge_a
@@ -52,6 +53,8 @@ mssh serve
 ```
 
 Copying to an existing directory appends the source name, as with `scp`. Remote paths must be absolute. Use `-r` for directories. All available routes are used for file transfers by default; `--route ID` selects a generated route ID such as `internal-1` and can be repeated. `--max-routes N` limits the number used concurrently.
+
+Copies between two SSH hosts stream through the `mssh` client without storing a local file. Use `-r` to copy a directory, including empty directories and symbolic links. Files are written to temporary paths and renamed when complete; `--verify` checks the destination's SHA-256 digest. Remote-to-remote copies currently use one route to each host and do not support partial transfer resume. After an interrupted single-file copy, rerun the command. For an interrupted directory copy, remove the incomplete destination directory before rerunning it.
 
 File transfers adapt batch size separately for each route. The initial size is `settings.chunk_size` (1 MiB by default); after three completed batches at a size, the worker compares median throughput and may double it. It stops increasing when a larger size is slower or would likely exceed 80% of the batch timeout, and shrinks after two consecutive failed batches. The first successful sample on a route includes SSH/SFTP connection time; failed connections count as unsuccessful samples. Each successful sample includes local I/O and SSH/SFTP transfer time. Remote journal checkpoints are serialized without holding the shared transfer-state lock. A single failure does not shrink the batch. Short files may finish before there are enough samples to tune.
 
