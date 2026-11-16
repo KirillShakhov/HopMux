@@ -91,7 +91,7 @@ pub fn failure_state(error: &anyhow::Error) -> &'static str {
 async fn authenticate(handle: &mut client::Handle<HostKeyPin>, node: &Node, route_path: &str, vault: &crate::vault::VaultStore, duration: Duration) -> Result<()> {
     let mut method_errors = Vec::new();
     if let Some(path) = &node.key_file {
-        crate::debug_log!("auth {} at {}: trying key", route_path, node.host);
+        crate::debug::progress(format_args!("auth {} at {}: trying key", route_path, node.host));
         let attempt: Result<bool> = timeout(duration, async {
             let expanded = if let Some(rest) = path.strip_prefix("~/") {
                 dirs::home_dir()
@@ -123,7 +123,7 @@ async fn authenticate(handle: &mut client::Handle<HostKeyPin>, node: &Node, rout
         }
     }
     if node.agent {
-        crate::debug_log!("auth {} at {}: trying SSH agent", route_path, node.host);
+        crate::debug::progress(format_args!("auth {} at {}: trying SSH agent", route_path, node.host));
         match timeout(duration, authenticate_agent(handle, node)).await
             .context("SSH agent authentication timed out")? {
             Ok(true) => { crate::debug_log!("auth {} at {}: SSH agent accepted", route_path, node.host); return Ok(()) },
@@ -147,7 +147,7 @@ async fn authenticate(handle: &mut client::Handle<HostKeyPin>, node: &Node, rout
         None
     };
     if let Some(password) = password {
-        crate::debug_log!("auth {} at {}: trying password", route_path, node.host);
+        crate::debug::progress(format_args!("auth {} at {}: trying password", route_path, node.host));
         if timeout(duration, handle.authenticate_password(&node.user, password))
             .await
             .context("password authentication timed out")??
@@ -199,7 +199,7 @@ async fn authenticate_agent(_: &mut client::Handle<HostKeyPin>, _: &Node) -> Res
 
 pub async fn connect(config: &Config, route: &Route) -> Result<Connection> {
     let route_path = output::route_label(route);
-    crate::debug_log!("route {route_path}: connecting");
+    crate::debug::progress(format_args!("route {route_path}: connecting"));
     let started = Instant::now();
     let duration = Duration::from_secs(config.settings.connect_timeout_secs);
     let ssh_config = Arc::new(client::Config {
@@ -213,7 +213,9 @@ pub async fn connect(config: &Config, route: &Route) -> Result<Connection> {
         let hop_started = Instant::now();
         let node = &config.nodes[hop];
         let host = route.addresses.get(hop).unwrap_or(&node.host);
-        crate::debug_log!("route {route_path}: hop {hop} connecting to {host}:{} ({})", node.port, if handles.is_empty() { "direct" } else { "forwarded" });
+        let hop_label = format!("route {}: hop {}/{} {hop}", route.name, handles.len() + 1, route.hops.len());
+        crate::debug::progress(format_args!("{hop_label}: opening {} connection to {host}:{}",
+            if handles.is_empty() { "TCP" } else { "forwarded TCP" }, node.port));
         let pin = HostKeyPin {
             fingerprint: node.host_key.clone(),
             route_path: route_path.clone(),
@@ -229,6 +231,7 @@ pub async fn connect(config: &Config, route: &Route) -> Result<Connection> {
                 format!("TCP forwarding timed out at node {hop} on route {route_path}")
             })?
             .with_context(|| format!("TCP forwarding refused for node {hop}"))?;
+            crate::debug::progress(format_args!("{hop_label}: TCP tunnel open; waiting for SSH handshake"));
             timeout(
                 duration,
                 client::connect_stream(ssh_config.clone(), channel.into_stream(), pin),
@@ -247,6 +250,7 @@ pub async fn connect(config: &Config, route: &Route) -> Result<Connection> {
                     format!("TCP connection timed out at node {hop} on route {route_path}")
                 })?
                 .with_context(|| format!("TCP connection failed for node {hop}"))?;
+            crate::debug::progress(format_args!("{hop_label}: TCP connected; waiting for SSH handshake"));
             timeout(
                 duration,
                 client::connect_stream(ssh_config.clone(), stream, pin),
@@ -259,18 +263,18 @@ pub async fn connect(config: &Config, route: &Route) -> Result<Connection> {
                 format!("SSH handshake failed at node {hop} on route {route_path}")
             })?
         };
-        crate::debug_log!("route {route_path}: hop {hop} SSH handshake complete");
+        crate::debug::progress(format_args!("{hop_label}: SSH handshake complete; authenticating"));
         authenticate(&mut handle, node, &route_path, &config.vault, duration)
             .await
             .with_context(|| format!("at node {hop} on route {route_path}"))?;
         handles.push(handle);
-        crate::debug_log!("route {route_path}: hop {hop} authenticated in {} ms", hop_started.elapsed().as_millis());
+        crate::debug::progress(format_args!("{hop_label}: authenticated in {} ms", hop_started.elapsed().as_millis()));
         hop_timings.push(HopTiming {
             node: hop.clone(),
             connect_ms: hop_started.elapsed().as_millis(),
         });
     }
-    crate::debug_log!("route {route_path}: connected in {} ms", started.elapsed().as_millis());
+    crate::debug::progress(format_args!("route {route_path}: connected in {} ms", started.elapsed().as_millis()));
     Ok(Connection {
         handles,
         elapsed: started.elapsed(),
