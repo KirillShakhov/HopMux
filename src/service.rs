@@ -1,4 +1,4 @@
-use crate::{config::{Config, Route}, terminal, transport, transfer, directory, output};
+use crate::{config::{Config, Route}, terminal, transport, transfer, directory, output, remote_copy};
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use std::{path::{Path, PathBuf}, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}};
@@ -474,6 +474,7 @@ async fn shell_io(
 pub enum CopySource {
     Local(PathBuf),
     Remote(String),
+    RemoteHost { host: String, path: String },
 }
 
 pub struct CopyPlan {
@@ -504,6 +505,12 @@ pub async fn prepare_copy(config: &Config, source: &str, destination: &str, recu
     let to = remote_spec(config, destination)?;
     crate::debug_log!("copy: source remote={}, destination remote={}, recursive={recursive}", from.is_some(), to.is_some());
     let (target, source, destination) = match (from, to) {
+        (Some((source_host, source_path)), Some((target, remote))) => {
+            crate::debug_log!("copy: remote {}:{} -> {}:{}", source_host, source_path, target, remote);
+            (target.to_owned(), CopySource::RemoteHost {
+                host: source_host.to_owned(), path: source_path.to_owned(),
+            }, remote.to_owned())
+        }
         (Some((target, remote)), None) => {
             let name = Path::new(remote).file_name().and_then(|n| n.to_str()).context("invalid remote filename")?;
             let local = Path::new(destination);
@@ -524,14 +531,19 @@ pub async fn prepare_copy(config: &Config, source: &str, destination: &str, recu
             crate::debug_log!("copy: upload local:{} -> {}:{}", local.display(), target, remote);
             (target.to_owned(), CopySource::Local(local), remote)
         }
-        _ => bail!("specify one local and one TARGET:/absolute/path endpoint"),
+        _ => bail!("specify at least one TARGET:/absolute/path endpoint"),
     };
-    let journals = transfer::list(config, &target).await?;
+    let journals = if matches!(source, CopySource::RemoteHost { .. }) {
+        Vec::new()
+    } else {
+        transfer::list(config, &target).await?
+    };
     crate::debug_log!("copy: checked {} remote transfer journals", journals.len());
     let partial = journals.into_iter().find(|j| {
         !j.published && j.destination == destination && match &source {
             CopySource::Local(p) => matches!(j.direction, transfer::Direction::Put) && j.source.as_str() == p.to_string_lossy().as_ref(),
             CopySource::Remote(p) => matches!(j.direction, transfer::Direction::Get) && j.source.as_str() == p.as_str(),
+            CopySource::RemoteHost { .. } => false,
         }
     });
     if let Some(journal) = &partial {
@@ -573,6 +585,9 @@ pub async fn execute_copy(config: &Config, plan: CopyPlan, action: PartialAction
                 transfer::get(config, &plan.target, &path, Path::new(&plan.destination)).await?;
                 Ok(())
             }
+        }
+        CopySource::RemoteHost { host, path } => {
+            remote_copy::copy(config, &host, &path, &plan.target, &plan.destination, plan.recursive).await
         }
     }
 }
